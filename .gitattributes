@@ -1,0 +1,5 @@
+# Keep text files using LF on every platform.
+* text=auto eol=lf
+
+# Preserve image bytes exactly.
+*.png binary
