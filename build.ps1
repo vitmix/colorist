@@ -1,3 +1,5 @@
+param([switch]$AlgoDebug)
+
 $ErrorActionPreference = 'Stop'
 
 # Portable Windows x64 tools. All files stay inside this project.
@@ -62,7 +64,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw 'OpenCV installation failed' }
     }
 
-    & $cmake -S $PSScriptRoot -B "$PSScriptRoot/build" @toolchain "-DOpenCV_DIR=$opencvPrefix/lib/cmake/opencv4"
+    $debugOption = if ($AlgoDebug) { 'ON' } else { 'OFF' }
+    & $cmake -S $PSScriptRoot -B "$PSScriptRoot/build" @toolchain "-DOpenCV_DIR=$opencvPrefix/lib/cmake/opencv4" "-DCOLORIST_DEBUG=$debugOption"
     if ($LASTEXITCODE -ne 0) { throw 'App configuration failed' }
     & $cmake --build "$PSScriptRoot/build" --parallel
     if ($LASTEXITCODE -ne 0) { throw 'App build failed' }
