@@ -1,5 +1,7 @@
 /.tools/
 /.deps/
 /build/
+/.venv/
+__pycache__/
 /result.png
 /overlay.png

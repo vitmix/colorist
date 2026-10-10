@@ -5,14 +5,18 @@
 #include <opencv2/imgproc.hpp>
 
 #include <chrono>
+#include <charconv>
 #include <cerrno>
 #include <filesystem>
 #include <iostream>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 #include "BaseAlgo.h"
+#include "Benchmark.h"
 
 CclAlgoType GetCclAlgoType(const std::string& ccl_algo) {
     if (ccl_algo == "base_spaghetti") {
@@ -22,8 +26,16 @@ CclAlgoType GetCclAlgoType(const std::string& ccl_algo) {
     } else if (ccl_algo == "base_bbdt") {
         return CclAlgoType::CCL_BBDT;
     } else {
-        return CclAlgoType::CCL_DEFAULT;
+        throw std::runtime_error("Unknown algorithm: " + ccl_algo);
     }
+}
+
+int ParseCount(const std::string& value, const char* option, int minimum) {
+    int count = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), count);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() || count < minimum)
+        throw std::runtime_error(std::string(option) + " must be an integer >= " + std::to_string(minimum));
+    return count;
 }
 
 void SaveImage(const std::string& filename, const cv::Mat& image) {
@@ -62,7 +74,8 @@ void ShowImageInfo(const cv::Mat& img) {
 int main(int argc, char* argv[]) {
     constexpr auto usage =
         "Usage: colorist --mask <mask.png> --color_mask <color_mask.png> --output <result.png>\n"
-        "                [--algo-type <base_spaghetti|base_sauf|base_bbdt>] [--parallel]\n";
+        "                [--algo-type <base_spaghetti|base_sauf|base_bbdt>] [--parallel]\n"
+        "                [--warmup <count>] [--runs <count>] [--metrics <measurements.json>]\n";
 
     if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         std::cout << usage;
@@ -71,6 +84,7 @@ int main(int argc, char* argv[]) {
 
     try {
         std::string mask_path, color_mask_path, output_path, algo_type;
+        std::string warmup_arg, runs_arg, metrics_path;
         bool parallel = false;
         for (int i = 1; i < argc; ++i) {
             const std::string option = argv[i];
@@ -85,6 +99,9 @@ int main(int argc, char* argv[]) {
                               : option == "--color_mask" ? &color_mask_path
                               : option == "--output" ? &output_path
                               : option == "--algo-type" ? &algo_type
+                              : option == "--warmup" ? &warmup_arg
+                              : option == "--runs" ? &runs_arg
+                              : option == "--metrics" ? &metrics_path
                               : nullptr;
             if (!path) {
                 throw std::runtime_error("Unknown argument: " + option);
@@ -96,12 +113,30 @@ int main(int argc, char* argv[]) {
                 throw std::runtime_error("Duplicate argument: " + option);
             }
             *path = argv[++i];
+            if (path->empty()) {
+                throw std::runtime_error("Missing value for " + option);
+            }
         }
         if (mask_path.empty() || color_mask_path.empty() || output_path.empty()) {
             throw std::runtime_error("--mask, --color_mask and --output are required");
         }
         if (algo_type.empty()) {
             algo_type = "base_spaghetti";
+        }
+        const auto ccl_type = GetCclAlgoType(algo_type);
+        const int warmup_runs = warmup_arg.empty() ? 0 : ParseCount(warmup_arg, "--warmup", 0);
+        const int measured_runs = runs_arg.empty() ? 1 : ParseCount(runs_arg, "--runs", 1);
+        const auto absolute_path = [](const std::string& path) {
+            return std::filesystem::weakly_canonical(std::filesystem::absolute(path));
+        };
+        if (absolute_path(output_path) == absolute_path(mask_path) ||
+            absolute_path(output_path) == absolute_path(color_mask_path)) {
+            throw std::runtime_error("Output must differ from the input files");
+        }
+        if (!metrics_path.empty() && (absolute_path(metrics_path) == absolute_path(mask_path) ||
+            absolute_path(metrics_path) == absolute_path(color_mask_path) ||
+            absolute_path(metrics_path) == absolute_path(output_path))) {
+            throw std::runtime_error("Measurements must differ from the input and output files");
         }
 
         const cv::Mat mask = cv::imread(mask_path, cv::IMREAD_GRAYSCALE);
@@ -130,7 +165,7 @@ int main(int argc, char* argv[]) {
 #endif
 
         BaseAlgo algo;
-        algo.SetAlgoType(GetCclAlgoType(algo_type));
+        algo.SetAlgoType(ccl_type);
 
         cv::setNumThreads(parallel ? -1 : 1);
         const int thread_count = cv::getNumThreads();
@@ -150,17 +185,45 @@ int main(int argc, char* argv[]) {
                   << (parallel_labeling ? "parallel version running" : "sequential version running")
                   << '\n';
 
-        const auto start = std::chrono::steady_clock::now();
-        const cv::Mat result = algo.Compute(mask, color_mask);
-        const auto elapsed = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - start);
-        std::cout << "Algorithm time: " << elapsed.count() << " ms\n";
+        if (warmup_runs > 0 || measured_runs > 1) {
+            std::cout << "Warm-up runs: " << warmup_runs << " -- measured runs: " << measured_runs << '\n';
+        }
+        for (int run = 0; run < warmup_runs; ++run)
+            algo.Compute(mask, color_mask);
+
+        std::vector<Measurement> measurements;
+        measurements.reserve(measured_runs);
+        cv::Mat result;
+        for (int run = 0; run < measured_runs; ++run) {
+            result.release(); // Match warm-up allocation behavior; exclude previous-image release.
+            const auto start = std::chrono::steady_clock::now();
+            cv::Mat current = algo.Compute(mask, color_mask);
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+            Measurement measurement;
+            measurement.total_ms = elapsed_ms;
 #ifdef COLORIST_TIMING
+            measurement.stages_ms = algo.GetTimings();
+#endif
+            measurements.push_back(measurement);
+            result = std::move(current);
+        }
+        const double mean_ms = std::accumulate(measurements.begin(), measurements.end(), 0.0,
+            [](double sum, const Measurement& sample) { return sum + sample.total_ms; }) / measured_runs;
+        std::cout << "Algorithm time" << (measured_runs > 1 ? " (mean)" : "") << ": " << mean_ms << " ms\n";
+#ifdef COLORIST_TIMING
+        if (measured_runs > 1)
+            std::cout << "Stage timings for the last measured run:\n";
         algo.PrintTimings();
 #endif
 
         SaveImage(output_path, result);
         std::cout << "Saved " << output_path << '\n';
+        if (!metrics_path.empty()) {
+            SaveMeasurements(metrics_path, algo_type, parallel, parallel_labeling, thread_count,
+                             mask, BaseAlgo::Connectivity, warmup_runs, measurements);
+            std::cout << "Saved " << metrics_path << '\n';
+        }
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n' << usage;

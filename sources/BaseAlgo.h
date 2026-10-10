@@ -23,12 +23,16 @@ using CclAlgoType = cv::ConnectedComponentsAlgorithmsTypes;
 class BaseAlgo : public IAlgo
 {
 public:
+    static constexpr int Connectivity = 4;
+
     void SetAlgoType(CclAlgoType type)
     {
         m_type = type;
     }
 
 #ifdef COLORIST_TIMING
+    const std::array<double, 5>& GetTimings() const { return m_timings_ms; }
+
     void PrintTimings() const
     {
         static constexpr const char* stages[] = {
@@ -75,7 +79,7 @@ public:
 #endif
 
         cv::Mat labels;
-        const int num_components = cv::connectedComponents(binary, labels, 4, CV_32S, m_type);
+        const int num_components = cv::connectedComponents(binary, labels, Connectivity, CV_32S, m_type);
 #ifdef COLORIST_TIMING
         record_time(1);
 #endif

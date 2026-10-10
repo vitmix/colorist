@@ -1,0 +1,2 @@
+# Only needed for --reference image comparison.
+Pillow>=9.0

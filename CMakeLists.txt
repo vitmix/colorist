@@ -8,6 +8,9 @@ list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/.deps/opencv")
 find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc imgcodecs)
 
 add_executable(colorist sources/main.cpp)
+target_compile_definitions(colorist PRIVATE
+    COLORIST_BUILD_CONFIG="$<CONFIG>"
+    COLORIST_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
 if(COLORIST_DEBUG)
     target_compile_definitions(colorist PRIVATE COLORIST_DEBUG)
 endif()
