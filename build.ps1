@@ -1,4 +1,4 @@
-param([switch]$AlgoDebug)
+param([switch]$AlgoDebug, [switch]$AlgoTiming)
 
 $ErrorActionPreference = 'Stop'
 
@@ -65,7 +65,8 @@ try {
     }
 
     $debugOption = if ($AlgoDebug) { 'ON' } else { 'OFF' }
-    & $cmake -S $PSScriptRoot -B "$PSScriptRoot/build" @toolchain "-DOpenCV_DIR=$opencvPrefix/lib/cmake/opencv4" "-DCOLORIST_DEBUG=$debugOption"
+    $timingOption = if ($AlgoTiming) { 'ON' } else { 'OFF' }
+    & $cmake -S $PSScriptRoot -B "$PSScriptRoot/build" @toolchain "-DOpenCV_DIR=$opencvPrefix/lib/cmake/opencv4" "-DCOLORIST_DEBUG=$debugOption" "-DCOLORIST_TIMING=$timingOption"
     if ($LASTEXITCODE -ne 0) { throw 'App configuration failed' }
     & $cmake --build "$PSScriptRoot/build" --parallel
     if ($LASTEXITCODE -ne 0) { throw 'App build failed' }

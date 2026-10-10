@@ -7,19 +7,46 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef COLORIST_DEBUG
+#ifdef COLORIST_TIMING
+#include <array>
+#include <chrono>
+#endif
+
+#if defined(COLORIST_DEBUG) || defined(COLORIST_TIMING)
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #endif
 
+using CclAlgoType = cv::ConnectedComponentsAlgorithmsTypes;
+
 class BaseAlgo : public IAlgo
 {
 public:
-    void SetAlgoType(cv::ConnectedComponentsAlgorithmsTypes type)
+    void SetAlgoType(CclAlgoType type)
     {
         m_type = type;
     }
+
+#ifdef COLORIST_TIMING
+    void PrintTimings() const
+    {
+        static constexpr const char* stages[] = {
+            "Threshold", "CCL", "Histogram", "Color selection", "Final coloring"
+        };
+        const char* border = "+-----------------+-----------+\n";
+        std::ostringstream table;
+        table << '\n' << border << "| Stage           |        ms |\n" << border
+              << std::fixed << std::setprecision(3);
+        for (std::size_t i = 0; i < m_timings_ms.size(); ++i)
+        {
+            table << "| " << std::left << std::setw(15) << stages[i]
+                  << " | " << std::right << std::setw(9) << m_timings_ms[i] << " |\n";
+        }
+        table << border;
+        std::cout << table.str();
+    }
+#endif
 
     cv::Mat Compute(const cv::Mat &mask, const cv::Mat &color_mask) override
     {
@@ -31,16 +58,35 @@ public:
         const int height = mask.rows;
         const int width = mask.cols;
 
+#ifdef COLORIST_TIMING
+        using Clock = std::chrono::steady_clock;
+        auto stage_start = Clock::now();
+        const auto record_time = [this, &stage_start](std::size_t stage)
+        {
+            m_timings_ms[stage] = std::chrono::duration<double, std::milli>(
+                Clock::now() - stage_start).count();
+        };
+#endif
         cv::Mat binary;
         cv::threshold(mask, binary, 127, 255, cv::THRESH_BINARY);
+#ifdef COLORIST_TIMING
+        record_time(0);
+        stage_start = Clock::now();
+#endif
 
         cv::Mat labels;
         const int num_components = cv::connectedComponents(binary, labels, 4, CV_32S, m_type);
+#ifdef COLORIST_TIMING
+        record_time(1);
+#endif
 
 #ifdef COLORIST_DEBUG
         std::cout << "Found " << num_components - 1 << " polygons" << '\n';
 #endif
 
+#ifdef COLORIST_TIMING
+        stage_start = Clock::now();
+#endif
         std::vector<std::unordered_map<std::uint32_t, std::size_t>> hist(num_components);
 
 #ifdef COLORIST_DEBUG
@@ -70,6 +116,11 @@ public:
             }
         }
 
+#ifdef COLORIST_TIMING
+        record_time(2);
+        stage_start = Clock::now();
+#endif
+
         // Label 0 is the background: keep it opaque black, without a histogram.
         std::vector<cv::Vec4b> final_colors(num_components, cv::Vec4b(0, 0, 0, 255));
 
@@ -87,6 +138,9 @@ public:
                 final_colors[comp_id] = UnpackColor(best->first);
             }
         }
+#ifdef COLORIST_TIMING
+        record_time(3);
+#endif
 
 #ifdef COLORIST_DEBUG
         std::sort(ids_of_interest.begin(), ids_of_interest.end());
@@ -123,6 +177,9 @@ public:
         }
 #endif
 
+#ifdef COLORIST_TIMING
+        stage_start = Clock::now();
+#endif
         cv::Mat output(height, width, CV_8UC4);
         for (int y = 0; y < height; ++y)
         {
@@ -136,10 +193,16 @@ public:
             }
         }
 
+#ifdef COLORIST_TIMING
+        record_time(4);
+#endif
         return output;
     }
 
 private:
+#ifdef COLORIST_TIMING
+    std::array<double, 5> m_timings_ms{};
+#endif
 #ifdef COLORIST_DEBUG
     // Approximate debug names using the nearest RGB color; alpha is shown separately.
     static const char* ColorName(const cv::Vec4b& color)
@@ -182,6 +245,5 @@ private:
                         static_cast<uchar>(color >> 16), static_cast<uchar>(color >> 24));
     }
 
-    cv::ConnectedComponentsAlgorithmsTypes m_type{
-        cv::ConnectedComponentsAlgorithmsTypes::CCL_DEFAULT};
+    CclAlgoType m_type{CclAlgoType::CCL_DEFAULT};
 };
