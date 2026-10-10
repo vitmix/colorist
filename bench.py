@@ -113,16 +113,17 @@ def execution_label(experiment):
     return requested if requested == actual else f"{requested} -> {actual}"
 
 
-def build_schedule(configurations, runs, rounds, seed):
+def build_schedule(configurations, runs, rounds, seed, shuffle=True):
     if runs < 1 or rounds < 1:
         raise ValueError("Runs and rounds must be >= 1")
     round_count = min(rounds, runs)
     per_round, extra = divmod(runs, round_count)
-    generator = random.Random(seed)
+    generator = random.Random(seed) if shuffle else None
     schedule = []
     for round_index in range(round_count):
         order = list(configurations)
-        generator.shuffle(order)
+        if generator is not None:
+            generator.shuffle(order)
         for position, (algorithm, mode) in enumerate(order, 1):
             schedule.append({"round": round_index + 1, "position": position,
                              "algorithm": algorithm, "mode": mode,
@@ -215,7 +216,8 @@ def parse_args():
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--warmup", type=int, default=3, help="Warm-up runs per configuration per round (default: 3)")
     parser.add_argument("--runs", type=int, default=30, help="Total measured runs per configuration (default: 30)")
-    parser.add_argument("--rounds", type=int, default=10, help="Shuffled rounds, capped at --runs (default: 10)")
+    parser.add_argument("--rounds", type=int, default=10, help="Experiment rounds, capped at --runs (default: 10)")
+    parser.add_argument("--no-shuffle", action="store_true", help="Keep configured algorithm/mode order in every round")
     parser.add_argument("--seed", type=int, help="Shuffle seed; omitted generates and records a random seed")
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("build/bench"))
@@ -246,8 +248,9 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     reference = load_rgba(args.reference) if args.reference else None
     configurations = list(itertools.product(args.algos, args.modes))
-    seed = args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
-    schedule = build_schedule(configurations, args.runs, args.rounds, seed)
+    shuffle = not args.no_shuffle
+    seed = (args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)) if shuffle else None
+    schedule = build_schedule(configurations, args.runs, args.rounds, seed, shuffle=shuffle)
     round_count = min(args.rounds, args.runs)
     context = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -259,9 +262,11 @@ def main():
         "reference": file_identity(args.reference) if args.reference else None,
         "warmup_runs": args.warmup, "measured_runs": args.runs,
         "rounds": round_count, "requested_rounds": args.rounds,
-        "shuffle_seed": seed, "execution_order": schedule,
+        "shuffle_enabled": shuffle, "shuffle_seed": seed, "execution_order": schedule,
     }
-    print(f"Shuffled rounds: {round_count} -- total runs/configuration: {args.runs} -- seed: {seed}", flush=True)
+    order_label = "Shuffled" if shuffle else "Ordered"
+    seed_label = f" -- seed: {seed}" if shuffle else ""
+    print(f"{order_label} rounds: {round_count} -- total runs/configuration: {args.runs}{seed_label}", flush=True)
     collected = {}
     for job in schedule:
         algorithm, mode = job["algorithm"], job["mode"]

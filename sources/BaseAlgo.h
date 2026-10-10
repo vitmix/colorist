@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
+#include <array>
 
 #ifdef COLORIST_TIMING
 #include <array>
@@ -91,12 +92,20 @@ public:
 #ifdef COLORIST_TIMING
         stage_start = Clock::now();
 #endif
-        std::vector<std::unordered_map<std::uint32_t, std::size_t>> hist(num_components);
+        // Intern exact BGRA values as compact IDs shared by all polygon histograms.
+        // Palette construction is included in histogram timing, without an extra image pass.
+        std::unordered_map<std::uint32_t, std::size_t> color_ids;
+        std::vector<std::uint32_t> palette;
+        std::vector<std::vector<std::size_t>> hist(num_components);
 
 #ifdef COLORIST_DEBUG
         constexpr std::uint32_t BLACK = 0xFF000000;
         std::vector<std::size_t> ids_of_interest;
 #endif
+
+        std::uint32_t prev_color = 0;
+        std::size_t prev_color_id = 0;
+        bool cache_valid = false;
 
         for (int y = 0; y < height; ++y)
         {
@@ -110,13 +119,29 @@ public:
                     continue;
 
                 const auto color = PackColor(cmask_base[x]);
+
+                if (!cache_valid || color != prev_color) {
+                    const auto [entry, inserted] = color_ids.try_emplace(color, palette.size());
+                    if (inserted) {
+                        palette.push_back(color);
+                    }
+                    prev_color = color;
+                    prev_color_id = entry->second;
+                    cache_valid = true;
+                }
+
+                auto& counts = hist[id];
+                if (counts.size() <= prev_color_id) {
+                    counts.resize(prev_color_id + 1);
+                }
+                ++counts[prev_color_id];
+
 #ifdef COLORIST_DEBUG
                 if (color == BLACK) {
                     ids_of_interest.push_back(id);
                 }
 #endif
 
-                ++hist[id][color];
             }
         }
 
@@ -131,16 +156,17 @@ public:
         for (int comp_id = 1; comp_id < num_components; ++comp_id)
         {
             const auto& comp = hist[comp_id];
-            const auto best = std::max_element(comp.begin(), comp.end(),
-                                              [](const auto& p1, const auto& p2)
-                                              {
-                                                  // Resolve ties consistently across labeling algorithms.
-                                                  return p1.second < p2.second ||
-                                                      (p1.second == p2.second && p1.first > p2.first);
-                                              });
-            if (best != comp.end()) {
-                final_colors[comp_id] = UnpackColor(best->first);
+            if (comp.empty())
+                continue;
+            std::size_t best = 0;
+            for (std::size_t color_id = 1; color_id < comp.size(); ++color_id)
+            {
+                // Resolve ties by packed color, independent of palette discovery order.
+                if (comp[color_id] > comp[best] ||
+                    (comp[color_id] == comp[best] && palette[color_id] < palette[best]))
+                    best = color_id;
             }
+            final_colors[comp_id] = UnpackColor(palette[best]);
         }
 #ifdef COLORIST_TIMING
         record_time(3);
@@ -152,7 +178,13 @@ public:
                               ids_of_interest.end());
         for (const auto id : ids_of_interest)
         {
-            std::vector<std::pair<std::uint32_t, std::size_t>> rows(hist[id].begin(), hist[id].end());
+            std::vector<std::pair<std::uint32_t, std::size_t>> rows;
+            const auto& counts = hist[id];
+            for (std::size_t color_id = 0; color_id < counts.size(); ++color_id)
+            {
+                if (counts[color_id] != 0)
+                    rows.emplace_back(palette[color_id], counts[color_id]);
+            }
             std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b)
             {
                 return a.second > b.second || (a.second == b.second && a.first < b.first);
