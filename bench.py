@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a sequential matrix of colorist experiments; timings come from C++."""
+"""Run shuffled rounds of colorist experiments; timings come from C++."""
 
 import argparse
 import csv
@@ -11,6 +11,7 @@ import math
 import os
 from pathlib import Path
 import platform
+import random
 import statistics
 import subprocess
 import sys
@@ -112,6 +113,51 @@ def execution_label(experiment):
     return requested if requested == actual else f"{requested} -> {actual}"
 
 
+def build_schedule(configurations, runs, rounds, seed):
+    if runs < 1 or rounds < 1:
+        raise ValueError("Runs and rounds must be >= 1")
+    round_count = min(rounds, runs)
+    per_round, extra = divmod(runs, round_count)
+    generator = random.Random(seed)
+    schedule = []
+    for round_index in range(round_count):
+        order = list(configurations)
+        generator.shuffle(order)
+        for position, (algorithm, mode) in enumerate(order, 1):
+            schedule.append({"round": round_index + 1, "position": position,
+                             "algorithm": algorithm, "mode": mode,
+                             "measured_runs": per_round + int(round_index < extra)})
+    return schedule
+
+
+def merge_batch(experiment, metadata, samples, job, comparison, result):
+    if experiment is None:
+        experiment = {"mode": job["mode"], "metadata": dict(metadata), "samples": [],
+                      "rounds": [], "comparison": None, "result": str(result)}
+        experiment["metadata"]["warmup_runs"] = 0
+        experiment["metadata"]["measured_runs"] = 0
+    for key, value in metadata.items():
+        if key not in ("warmup_runs", "measured_runs") and experiment["metadata"][key] != value:
+            raise ValueError(f"Configuration changed between rounds: {key}")
+    experiment["metadata"]["warmup_runs"] += metadata["warmup_runs"]
+    experiment["metadata"]["measured_runs"] += len(samples)
+    experiment["samples"].extend({**sample, "round": job["round"], "position": job["position"],
+                                  "iteration_in_round": iteration}
+                                 for iteration, sample in enumerate(samples, 1))
+    experiment["rounds"].append({"round": job["round"], "position": job["position"],
+                                "warmup_runs": metadata["warmup_runs"], "measured_runs": len(samples),
+                                "comparison": comparison})
+    # Keep the first failure visible even when subsequent rounds match the reference.
+    if experiment["comparison"] is None or experiment["comparison"]["match"]:
+        experiment["comparison"] = comparison
+    experiment["statistics"] = summarize([sample["total_ms"] for sample in experiment["samples"]])
+    experiment["stage_statistics"] = {
+        stage: summarize([sample[stage] for sample in experiment["samples"]])
+        for stage in STAGES if metadata["timing_enabled"]
+    }
+    return experiment
+
+
 def file_identity(path):
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -138,14 +184,16 @@ def save_reports(directory, context, experiments):
                     "effective_algorithm": metadata["algorithm_effective"],
                     "mode": experiment["mode"],
                     "labeling": "parallel" if metadata["parallel_labeling"] else "sequential",
-                    "threads": metadata["opencv_threads"]}
+                    "threads": metadata["opencv_threads"], "rounds": len(experiment["rounds"])}
         comparison = experiment["comparison"]
         summaries.append({**identity, "runs": len(experiment["samples"]),
                           **experiment["statistics"], "reference": comparison_label(comparison),
                           "differing_pixels": comparison["differing_pixels"] if comparison else "",
                           "difference_percent": comparison["difference_percent"] if comparison else ""})
         for iteration, sample in enumerate(experiment["samples"], 1):
-            raw.append({**identity, "iteration": iteration, "total_ms": sample["total_ms"],
+            raw.append({**identity, "iteration": iteration, "round": sample["round"],
+                        "position": sample["position"], "iteration_in_round": sample["iteration_in_round"],
+                        "total_ms": sample["total_ms"],
                         **{stage: sample.get(stage, "") for stage in STAGES}})
         for stage, values in experiment["stage_statistics"].items():
             stages.append({**identity, "stage": stage, **values})
@@ -165,13 +213,15 @@ def parse_args():
     parser.add_argument("--color-mask", type=Path, required=True)
     parser.add_argument("--algos", nargs="+", choices=ALGORITHMS, default=list(ALGORITHMS))
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--runs", type=int, default=30)
+    parser.add_argument("--warmup", type=int, default=3, help="Warm-up runs per configuration per round (default: 3)")
+    parser.add_argument("--runs", type=int, default=30, help="Total measured runs per configuration (default: 30)")
+    parser.add_argument("--rounds", type=int, default=10, help="Shuffled rounds, capped at --runs (default: 10)")
+    parser.add_argument("--seed", type=int, help="Shuffle seed; omitted generates and records a random seed")
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("build/bench"))
     args = parser.parse_args()
-    if args.runs < 1 or args.warmup < 0:
-        parser.error("--runs must be >= 1 and --warmup must be >= 0")
+    if args.runs < 1 or args.warmup < 0 or args.rounds < 1:
+        parser.error("--runs and --rounds must be >= 1 and --warmup must be >= 0")
     for name in ("exe", "mask", "color_mask", "reference"):
         path = getattr(args, name)
         if path is not None:
@@ -195,6 +245,10 @@ def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     reference = load_rgba(args.reference) if args.reference else None
+    configurations = list(itertools.product(args.algos, args.modes))
+    seed = args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)
+    schedule = build_schedule(configurations, args.runs, args.rounds, seed)
+    round_count = min(args.rounds, args.runs)
     context = {
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "machine": {"system": platform.system(), "release": platform.release(),
@@ -204,31 +258,38 @@ def main():
         "color_mask": file_identity(args.color_mask),
         "reference": file_identity(args.reference) if args.reference else None,
         "warmup_runs": args.warmup, "measured_runs": args.runs,
+        "rounds": round_count, "requested_rounds": args.rounds,
+        "shuffle_seed": seed, "execution_order": schedule,
     }
-    experiments = []
-    for algorithm, mode in itertools.product(args.algos, args.modes):
+    print(f"Shuffled rounds: {round_count} -- total runs/configuration: {args.runs} -- seed: {seed}", flush=True)
+    collected = {}
+    for job in schedule:
+        algorithm, mode = job["algorithm"], job["mode"]
         name = f"{algorithm}-{mode}"
         result_path = args.output_dir / f"{name}.png"
         metrics_path = args.output_dir / f"{name}.json"
         command = [str(args.exe), "--mask", str(args.mask), "--color_mask", str(args.color_mask),
                    "--output", str(result_path), "--algo-type", algorithm,
-                   "--warmup", str(args.warmup), "--runs", str(args.runs), "--metrics", str(metrics_path)]
+                   "--warmup", str(args.warmup), "--runs", str(job["measured_runs"]), "--metrics", str(metrics_path)]
         if mode == "parallel":
             command.append("--parallel")
-        print(f"Running {algorithm} / {mode} ({args.warmup} warm-up + {args.runs} measured)...", flush=True)
+        print(f"Round {job['round']}/{round_count}, {job['position']}/{len(configurations)}: "
+              f"{algorithm} / {mode} ({args.warmup} warm-up + {job['measured_runs']} measured)...", flush=True)
         completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if completed.returncode:
             raise RuntimeError(f"{name} exited with {completed.returncode}:\n{completed.stderr or completed.stdout}")
         with metrics_path.open(encoding="utf-8") as stream:
             data = json.load(stream)
-        metadata, samples = validate_measurements(data, algorithm, mode, args.runs, args.warmup)
+        metadata, samples = validate_measurements(data, algorithm, mode, job["measured_runs"], args.warmup)
         comparison = compare_images(load_rgba(result_path), reference) if reference is not None else None
-        experiments.append({"mode": mode, "metadata": metadata, "samples": samples,
-                            "statistics": summarize([sample["total_ms"] for sample in samples]),
-                            "stage_statistics": {stage: summarize([sample[stage] for sample in samples])
-                                                 for stage in STAGES if metadata["timing_enabled"]},
-                            "comparison": comparison, "result": str(result_path)})
+        experiment = merge_batch(collected.get((algorithm, mode)), metadata, samples, job, comparison, result_path)
+        collected[algorithm, mode] = experiment
+        # Retain all completed rounds in the configuration JSON, not just its last app invocation.
+        with metrics_path.open("w", encoding="utf-8") as stream:
+            json.dump({"schema_version": 1, **experiment}, stream, indent=2, allow_nan=False)
+            stream.write("\n")
 
+    experiments = [collected[configuration] for configuration in configurations]
     save_reports(args.output_dir, context, experiments)
     print("\nTotal algorithm times (ms; sample standard deviation):")
     rows = []
