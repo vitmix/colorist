@@ -86,7 +86,8 @@ int main(int argc, char* argv[]) {
     constexpr auto usage =
         "Usage: colorist --mask <mask.png> --color_mask <color_mask.png> --output <result.png>\n"
         "                [--algo-type <base_spaghetti|base_sauf|base_bbdt|rle>] [--parallel]\n"
-        "                [--warmup <count>] [--runs <count>] [--metrics <measurements.json>]\n";
+        "                [--lifecycle <reuse|fresh>] [--warmup <count>] [--runs <count>]\n"
+        "                [--metrics <measurements.json>]\n";
 
     if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
         std::cout << usage;
@@ -95,7 +96,7 @@ int main(int argc, char* argv[]) {
 
     try {
         std::string mask_path, color_mask_path, output_path, algo_type;
-        std::string warmup_arg, runs_arg, metrics_path;
+        std::string warmup_arg, runs_arg, metrics_path, lifecycle;
         bool parallel = false;
         for (int i = 1; i < argc; ++i) {
             const std::string option = argv[i];
@@ -113,6 +114,7 @@ int main(int argc, char* argv[]) {
                               : option == "--warmup" ? &warmup_arg
                               : option == "--runs" ? &runs_arg
                               : option == "--metrics" ? &metrics_path
+                              : option == "--lifecycle" ? &lifecycle
                               : nullptr;
             if (!path) {
                 throw std::runtime_error("Unknown argument: " + option);
@@ -135,6 +137,11 @@ int main(int argc, char* argv[]) {
             algo_type = "base_spaghetti";
         }
         auto algo = CreateAlgo(algo_type);
+        if (lifecycle.empty())
+            lifecycle = "reuse";
+        if (lifecycle != "reuse" && lifecycle != "fresh")
+            throw std::runtime_error("--lifecycle must be reuse or fresh");
+        const bool fresh = lifecycle == "fresh";
         const int warmup_runs = warmup_arg.empty() ? 0 : ParseCount(warmup_arg, "--warmup", 0);
         const int measured_runs = runs_arg.empty() ? 1 : ParseCount(runs_arg, "--runs", 1);
         const auto absolute_path = [](const std::string& path) {
@@ -199,23 +206,37 @@ int main(int argc, char* argv[]) {
         if (warmup_runs > 0 || measured_runs > 1) {
             std::cout << "Warm-up runs: " << warmup_runs << " -- measured runs: " << measured_runs << '\n';
         }
-        for (int run = 0; run < warmup_runs; ++run)
-            algo->Compute(mask, color_mask);
+        std::cout << "Lifecycle: " << lifecycle
+                  << (fresh ? " (Compute + instance destruction timed)\n" : " (Compute including reset timed)\n");
+        for (int run = 0; run < warmup_runs; ++run) {
+            auto warmup_algo = fresh ? CreateAlgo(algo_type) : nullptr;
+            (warmup_algo ? warmup_algo.get() : algo.get())->Compute(mask, color_mask);
+        }
 
         std::vector<Measurement> measurements;
         measurements.reserve(measured_runs);
         cv::Mat result;
         for (int run = 0; run < measured_runs; ++run) {
             result.release(); // Match warm-up allocation behavior; exclude previous-image release.
+            auto fresh_algo = fresh ? CreateAlgo(algo_type) : nullptr;
+            auto* current_algo = fresh_algo ? fresh_algo.get() : algo.get();
             const auto start = std::chrono::steady_clock::now();
-            cv::Mat current = algo->Compute(mask, color_mask);
+            cv::Mat current = current_algo->Compute(mask, color_mask);
             const double elapsed_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
             Measurement measurement;
             measurement.total_ms = elapsed_ms;
 #ifdef COLORIST_TIMING
-            measurement.stages_ms = algo->GetTimings();
+            measurement.stages_ms = current_algo->GetTimings();
 #endif
+            if (fresh_algo) {
+                // Keep the returned image alive; time only algorithm instance/workspace destruction.
+                const auto teardown_start = std::chrono::steady_clock::now();
+                fresh_algo.reset();
+                measurement.teardown_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - teardown_start).count();
+                measurement.total_ms += measurement.teardown_ms;
+            }
             measurements.push_back(measurement);
             result = std::move(current);
         }
@@ -225,14 +246,16 @@ int main(int argc, char* argv[]) {
 #ifdef COLORIST_TIMING
         if (measured_runs > 1)
             std::cout << "Stage timings for the last measured run:\n";
-        algo->PrintTimings();
+        algo->PrintTimings(measurements.back().stages_ms);
 #endif
+        if (fresh)
+            std::cout << "Instance cleanup (last measured run): " << measurements.back().teardown_ms << " ms\n";
 
         SaveImage(output_path, result);
         std::cout << "Saved " << output_path << '\n';
         if (!metrics_path.empty()) {
             SaveMeasurements(metrics_path, algo_type, parallel, parallel_labeling, thread_count,
-                             mask, BaseAlgo::Connectivity, warmup_runs, measurements, *algo);
+                             mask, BaseAlgo::Connectivity, warmup_runs, measurements, *algo, lifecycle);
             std::cout << "Saved " << metrics_path << '\n';
         }
         return 0;

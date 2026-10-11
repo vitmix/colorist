@@ -43,7 +43,8 @@ public:
         return keys;
     }
 
-    void PrintTimings() const override
+    using IAlgo::PrintTimings;
+    void PrintTimings(const std::array<double, 5>& timings) const override
     {
         static constexpr const char* stages[] = {
             "Threshold", "CCL", "Histogram", "Color selection", "Final coloring"
@@ -52,10 +53,10 @@ public:
         std::ostringstream table;
         table << '\n' << border << "| Stage           |        ms |\n" << border
               << std::fixed << std::setprecision(3);
-        for (std::size_t i = 0; i < m_timings_ms.size(); ++i)
+        for (std::size_t i = 0; i < timings.size(); ++i)
         {
             table << "| " << std::left << std::setw(15) << stages[i]
-                  << " | " << std::right << std::setw(9) << m_timings_ms[i] << " |\n";
+                  << " | " << std::right << std::setw(9) << timings[i] << " |\n";
         }
         table << border;
         std::cout << table.str();

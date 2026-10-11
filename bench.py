@@ -19,6 +19,7 @@ import sys
 
 ALGORITHMS = ("base_spaghetti", "base_sauf", "base_bbdt")
 MODES = ("sequential", "parallel")
+LIFECYCLES = ("reuse", "fresh")
 STAGES = ("threshold_ms", "ccl_ms", "histogram_ms", "color_selection_ms", "final_coloring_ms")
 STAGE_LABELS = ("Threshold", "CCL", "Histogram", "Selection", "Coloring")
 RLE_STAGES = ("setup_ms", "scan_ccl_histogram_ms", "histogram_aggregation_ms",
@@ -69,7 +70,7 @@ def compare_images(actual, reference):
             "differing_pixels": count, "difference_percent": 100.0 * count / pixels}
 
 
-def validate_measurements(data, algorithm, mode, runs, warmup):
+def validate_measurements(data, algorithm, mode, runs, warmup, lifecycle="reuse"):
     if data.get("schema_version") != 1:
         raise ValueError("Unsupported measurements schema; rebuild colorist")
     metadata = data["metadata"]
@@ -79,6 +80,8 @@ def validate_measurements(data, algorithm, mode, runs, warmup):
             metadata["measured_runs"] != runs or metadata["warmup_runs"] != warmup or
             len(samples) != runs):
         raise ValueError("Measurements do not match the requested experiment")
+    if metadata.get("lifecycle", "reuse") != lifecycle:
+        raise ValueError("Measurements do not match the requested lifecycle")
     expected = "base_sauf" if algorithm == "base_bbdt" and metadata["connectivity"] == 4 else algorithm
     if metadata["algorithm_effective"] != expected:
         raise ValueError("Unexpected effective labeling algorithm")
@@ -93,10 +96,15 @@ def validate_measurements(data, algorithm, mode, runs, warmup):
         raise ValueError("Unexpected timing stage keys")
     keys = ("total_ms",) + (stages if metadata["timing_enabled"] else ())
     for sample in samples:
-        for key in keys:
+        sample_keys = keys + (("teardown_ms",) if lifecycle == "fresh" or "teardown_ms" in sample else ())
+        for key in sample_keys:
             value = sample[key]
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"Invalid timing: {key}={value}")
+        if sample.get("teardown_ms", 0) > sample["total_ms"]:
+            raise ValueError("Instance cleanup cannot exceed total algorithm time")
+        if lifecycle == "reuse" and sample.get("teardown_ms", 0) != 0:
+            raise ValueError("Reuse samples must not time instance destruction")
     return metadata, samples
 
 
@@ -125,6 +133,10 @@ def execution_label(experiment):
     return requested if requested == actual else f"{requested} -> {actual}"
 
 
+def experiment_name(algorithm, mode, lifecycle):
+    return f"{algorithm}-{mode}" + ("-fresh" if lifecycle == "fresh" else "")
+
+
 def build_schedule(configurations, runs, rounds, seed, shuffle=True):
     if runs < 1 or rounds < 1:
         raise ValueError("Runs and rounds must be >= 1")
@@ -136,16 +148,19 @@ def build_schedule(configurations, runs, rounds, seed, shuffle=True):
         order = list(configurations)
         if generator is not None:
             generator.shuffle(order)
-        for position, (algorithm, mode) in enumerate(order, 1):
+        for position, configuration in enumerate(order, 1):
+            algorithm, mode = configuration[:2]
+            lifecycle = configuration[2] if len(configuration) > 2 else "reuse"
             schedule.append({"round": round_index + 1, "position": position,
-                             "algorithm": algorithm, "mode": mode,
+                             "algorithm": algorithm, "mode": mode, "lifecycle": lifecycle,
                              "measured_runs": per_round + int(round_index < extra)})
     return schedule
 
 
 def merge_batch(experiment, metadata, samples, job, comparison, result):
     if experiment is None:
-        experiment = {"mode": job["mode"], "metadata": dict(metadata), "samples": [],
+        experiment = {"mode": job["mode"], "lifecycle": job.get("lifecycle", "reuse"),
+                      "metadata": dict(metadata), "samples": [],
                       "rounds": [], "comparison": None, "result": str(result)}
         experiment["metadata"]["warmup_runs"] = 0
         experiment["metadata"]["measured_runs"] = 0
@@ -164,6 +179,7 @@ def merge_batch(experiment, metadata, samples, job, comparison, result):
     if experiment["comparison"] is None or experiment["comparison"]["match"]:
         experiment["comparison"] = comparison
     experiment["statistics"] = summarize([sample["total_ms"] for sample in experiment["samples"]])
+    experiment["teardown_statistics"] = summarize([sample.get("teardown_ms", 0) for sample in experiment["samples"]])
     experiment["stage_statistics"] = {
         stage: summarize([sample[stage] for sample in experiment["samples"]])
         for stage in timing_stages(metadata) if metadata["timing_enabled"]
@@ -198,17 +214,21 @@ def save_reports(directory, context, experiments):
         identity = {"algorithm": metadata["algorithm_requested"],
                     "effective_algorithm": metadata["algorithm_effective"],
                     "mode": experiment["mode"],
+                    "lifecycle": experiment["lifecycle"],
                     "labeling": "parallel" if metadata["parallel_labeling"] else "sequential",
                     "threads": metadata["opencv_threads"], "rounds": len(experiment["rounds"])}
         comparison = experiment["comparison"]
         summaries.append({**identity, "runs": len(experiment["samples"]),
-                          **experiment["statistics"], "reference": comparison_label(comparison),
+                          **experiment["statistics"],
+                          "teardown_median_ms": experiment["teardown_statistics"]["median_ms"],
+                          "reference": comparison_label(comparison),
                           "differing_pixels": comparison["differing_pixels"] if comparison else "",
                           "difference_percent": comparison["difference_percent"] if comparison else ""})
         for iteration, sample in enumerate(experiment["samples"], 1):
             raw.append({**identity, "iteration": iteration, "round": sample["round"],
                         "position": sample["position"], "iteration_in_round": sample["iteration_in_round"],
                         "total_ms": sample["total_ms"],
+                        "teardown_ms": sample.get("teardown_ms", 0),
                         **{stage: sample.get(stage, "") for stage in all_stages}})
         for stage, values in experiment["stage_statistics"].items():
             stages.append({**identity, "stage": stage, **values})
@@ -228,6 +248,8 @@ def parse_args():
     parser.add_argument("--color-mask", type=Path, required=True)
     parser.add_argument("--algos", nargs="+", choices=ALGORITHMS + ("rle",), default=list(ALGORITHMS))
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    parser.add_argument("--lifecycles", nargs="+", choices=LIFECYCLES, default=list(LIFECYCLES),
+                        help="Instance reuse/fresh modes (default: both)")
     parser.add_argument("--warmup", type=int, default=3, help="Warm-up runs per configuration per round (default: 3)")
     parser.add_argument("--runs", type=int, default=30, help="Total measured runs per configuration (default: 30)")
     parser.add_argument("--rounds", type=int, default=10, help="Experiment rounds, capped at --runs (default: 10)")
@@ -248,10 +270,12 @@ def parse_args():
     args.output_dir = args.output_dir.resolve()
     args.algos = list(dict.fromkeys(args.algos))
     args.modes = list(dict.fromkeys(args.modes))
+    args.lifecycles = list(dict.fromkeys(args.lifecycles))
     protected = {args.exe, args.mask, args.color_mask, args.reference}
     destinations = [args.output_dir / name for name in ("summary.csv", "measurements.csv", "stages.csv", "report.json")]
-    for algorithm, mode in itertools.product(args.algos, args.modes):
-        destinations.extend(args.output_dir / f"{algorithm}-{mode}.{extension}" for extension in ("png", "json"))
+    for algorithm, mode, lifecycle in itertools.product(args.algos, args.modes, args.lifecycles):
+        name = experiment_name(algorithm, mode, lifecycle)
+        destinations.extend(args.output_dir / f"{name}.{extension}" for extension in ("png", "json"))
     if any(path.resolve() in protected for path in destinations):
         parser.error("Output directory would overwrite an input, executable or reference; choose another directory")
     return args
@@ -261,7 +285,7 @@ def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     reference = load_rgba(args.reference) if args.reference else None
-    configurations = list(itertools.product(args.algos, args.modes))
+    configurations = list(itertools.product(args.algos, args.modes, args.lifecycles))
     shuffle = not args.no_shuffle
     seed = (args.seed if args.seed is not None else random.SystemRandom().randrange(2**32)) if shuffle else None
     schedule = build_schedule(configurations, args.runs, args.rounds, seed, shuffle=shuffle)
@@ -275,6 +299,7 @@ def main():
         "color_mask": file_identity(args.color_mask),
         "reference": file_identity(args.reference) if args.reference else None,
         "warmup_runs": args.warmup, "measured_runs": args.runs,
+        "lifecycles": args.lifecycles,
         "rounds": round_count, "requested_rounds": args.rounds,
         "shuffle_enabled": shuffle, "shuffle_seed": seed, "execution_order": schedule,
     }
@@ -283,26 +308,27 @@ def main():
     print(f"{order_label} rounds: {round_count} -- total runs/configuration: {args.runs}{seed_label}", flush=True)
     collected = {}
     for job in schedule:
-        algorithm, mode = job["algorithm"], job["mode"]
-        name = f"{algorithm}-{mode}"
+        algorithm, mode, lifecycle = job["algorithm"], job["mode"], job["lifecycle"]
+        configuration = (algorithm, mode, lifecycle)
+        name = experiment_name(*configuration)
         result_path = args.output_dir / f"{name}.png"
         metrics_path = args.output_dir / f"{name}.json"
         command = [str(args.exe), "--mask", str(args.mask), "--color_mask", str(args.color_mask),
-                   "--output", str(result_path), "--algo-type", algorithm,
+                   "--output", str(result_path), "--algo-type", algorithm, "--lifecycle", lifecycle,
                    "--warmup", str(args.warmup), "--runs", str(job["measured_runs"]), "--metrics", str(metrics_path)]
         if mode == "parallel":
             command.append("--parallel")
         print(f"Round {job['round']}/{round_count}, {job['position']}/{len(configurations)}: "
-              f"{algorithm} / {mode} ({args.warmup} warm-up + {job['measured_runs']} measured)...", flush=True)
+              f"{algorithm} / {mode} / {lifecycle} ({args.warmup} warm-up + {job['measured_runs']} measured)...", flush=True)
         completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if completed.returncode:
             raise RuntimeError(f"{name} exited with {completed.returncode}:\n{completed.stderr or completed.stdout}")
         with metrics_path.open(encoding="utf-8") as stream:
             data = json.load(stream)
-        metadata, samples = validate_measurements(data, algorithm, mode, job["measured_runs"], args.warmup)
+        metadata, samples = validate_measurements(data, algorithm, mode, job["measured_runs"], args.warmup, lifecycle)
         comparison = compare_images(load_rgba(result_path), reference) if reference is not None else None
-        experiment = merge_batch(collected.get((algorithm, mode)), metadata, samples, job, comparison, result_path)
-        collected[algorithm, mode] = experiment
+        experiment = merge_batch(collected.get(configuration), metadata, samples, job, comparison, result_path)
+        collected[configuration] = experiment
         # Retain all completed rounds in the configuration JSON, not just its last app invocation.
         with metrics_path.open("w", encoding="utf-8") as stream:
             json.dump({"schema_version": 1, **experiment}, stream, indent=2, allow_nan=False)
@@ -316,22 +342,26 @@ def main():
         meta, stats = experiment["metadata"], experiment["statistics"]
         rows.append([meta["algorithm_requested"].removeprefix("base_"),
                      meta["algorithm_effective"].removeprefix("base_"), execution_label(experiment),
+                     experiment["lifecycle"],
                      meta["opencv_threads"], len(experiment["samples"]),
                      f"{stats['median_ms']:.3f}", f"{stats['mean_ms']:.3f}", f"{stats['stddev_ms']:.3f}",
                      f"{stats['p95_ms']:.3f}", f"{stats['min_ms']:.3f}", f"{stats['max_ms']:.3f}",
+                     f"{experiment['teardown_statistics']['median_ms']:.3f}",
                      comparison_label(experiment["comparison"])])
-    print_table(["Algorithm", "Effective", "Mode", "Threads", "Runs", "Median", "Mean", "Stddev", "P95", "Min", "Max", "Reference"], rows)
+    print_table(["Algorithm", "Effective", "Mode", "Lifecycle", "Threads", "Runs", "Median", "Mean", "Stddev", "P95", "Min", "Max", "Cleanup", "Reference"], rows)
     for stages, labels, title in ((STAGES, STAGE_LABELS, "Median stage times (ms):"),
                                   (RLE_STAGES, RLE_STAGE_LABELS, "Median RLE stage times (ms):")):
         stage_rows = [[experiment["metadata"]["algorithm_requested"].removeprefix("base_"), execution_label(experiment),
+                       experiment["lifecycle"],
                        *(f"{experiment['stage_statistics'][stage]['median_ms']:.3f}" for stage in stages)]
                       for experiment in experiments if experiment["stage_statistics"]
                       and timing_stages(experiment["metadata"]) == stages]
         if stage_rows:
             print(f"\n{title}")
-            print_table(["Algorithm", "Mode", *labels], stage_rows)
+            print_table(["Algorithm", "Mode", "Lifecycle", *labels], stage_rows)
     if not any(experiment["stage_statistics"] for experiment in experiments):
         print("\nStage timings unavailable: rebuild with -AlgoTiming / --algo-timing.")
+    print("\nFresh totals include instance cleanup; Cleanup shows its median. Stage timings cover Compute only.")
     print(f"\nResults, raw JSON, CSV statistics and report.json: {args.output_dir}")
     return 1 if any(experiment["comparison"] and not experiment["comparison"]["match"]
                     for experiment in experiments) else 0

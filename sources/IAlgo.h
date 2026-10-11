@@ -15,6 +15,7 @@ public:
 #ifdef COLORIST_TIMING
     virtual const std::array<double, 5>& GetTimings() const = 0;
     virtual const std::array<const char*, 5>& GetTimingKeys() const = 0;
-    virtual void PrintTimings() const = 0;
+    virtual void PrintTimings(const std::array<double, 5>& timings) const = 0;
+    void PrintTimings() const { PrintTimings(GetTimings()); }
 #endif
 };

@@ -13,6 +13,7 @@
 struct Measurement
 {
     double total_ms{};
+    double teardown_ms{};
 #ifdef COLORIST_TIMING
     std::array<double, 5> stages_ms{};
 #endif
@@ -21,7 +22,8 @@ struct Measurement
 inline void SaveMeasurements(const std::string& filename, const std::string& algorithm,
                              bool parallel_requested, bool parallel_labeling, int threads,
                              const cv::Mat& mask, int connectivity, int warmup_runs,
-                             const std::vector<Measurement>& measurements, const IAlgo& algo)
+                             const std::vector<Measurement>& measurements, const IAlgo& algo,
+                             const std::string& lifecycle)
 {
     cv::FileStorage file(filename, cv::FileStorage::WRITE | cv::FileStorage::FORMAT_JSON);
     if (!file.isOpened())
@@ -43,6 +45,7 @@ inline void SaveMeasurements(const std::string& filename, const std::string& alg
 
     file << "schema_version" << 1 << "metadata" << "{"
          << "algorithm_requested" << algorithm
+         << "lifecycle" << lifecycle
          << "algorithm_effective" << (algorithm == "base_bbdt" && connectivity == 4 ? "base_sauf" : algorithm)
          << "parallel_requested" << int(parallel_requested)
          << "parallel_labeling" << int(parallel_labeling)
@@ -76,7 +79,7 @@ inline void SaveMeasurements(const std::string& filename, const std::string& alg
     file << "]" << "}" << "samples" << "[";
     for (const auto& measurement : measurements)
     {
-        file << "{" << "total_ms" << measurement.total_ms;
+        file << "{" << "total_ms" << measurement.total_ms << "teardown_ms" << measurement.teardown_ms;
 #ifdef COLORIST_TIMING
         for (std::size_t stage = 0; stage < measurement.stages_ms.size(); ++stage)
             file << algo.GetTimingKeys()[stage] << measurement.stages_ms[stage];

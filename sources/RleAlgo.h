@@ -35,7 +35,8 @@ public:
         return keys;
     }
 
-    void PrintTimings() const override {
+    using IAlgo::PrintTimings;
+    void PrintTimings(const std::array<double, 5>& timings) const override {
         static constexpr const char* stages[] = {
             "Setup", "Scan/CCL/hist", "Hist aggregation", "Color selection", "Final coloring"
         };
@@ -43,9 +44,9 @@ public:
         std::ostringstream table;
         table << '\n' << border << "| RLE stage        |        ms |\n" << border
               << std::fixed << std::setprecision(3);
-        for (std::size_t i = 0; i < m_timings_ms.size(); ++i) {
+        for (std::size_t i = 0; i < timings.size(); ++i) {
             table << "| " << std::left << std::setw(16) << stages[i]
-                  << " | " << std::right << std::setw(9) << m_timings_ms[i] << " |\n";
+                  << " | " << std::right << std::setw(9) << timings[i] << " |\n";
         }
         table << border;
         std::cout << table.str();
@@ -121,8 +122,7 @@ public:
                     int run_end = c - 1;
 
                     runs.push_back({ run_id, y, run_start, run_end });
-                    connectivity.push_back(run_id);
-                    sizes.push_back(1);
+                    nodes.push_back({run_id, 1});
                     
                     const Run& curr_run = runs.back();
                     while (prr != prev_row_run_id_stop) {
@@ -159,7 +159,7 @@ public:
         // Aggregate each run's histogram into its final component root.
         for (const auto & run : runs) {
             const auto root = Root(run.id);
-            connectivity[run.id] = root; // Cache the final root for selection and coloring.
+            nodes[run.id].parent = root; // Cache the final root for selection and coloring.
             if (root != run.id) {
                 auto& root_hist = histogram[root];
                 auto& run_hist = histogram[run.id];
@@ -180,7 +180,7 @@ public:
         // Select a winner once per root, including valid packed color zero.
         std::vector<cv::Vec4b> final_colors(runs.size());
         for (const auto& run : runs) {
-            if (connectivity[run.id] != run.id)
+            if (nodes[run.id].parent != run.id)
                 continue;
 
             const auto& hist = histogram[run.id];
@@ -202,7 +202,7 @@ public:
         for (const auto& run : runs) {
             auto* row = output.ptr<cv::Vec4b>(run.y);
             std::fill(row + run.x0, row + run.x1 + 1,
-                      final_colors[connectivity[run.id]]);
+                      final_colors[nodes[run.id].parent]);
         }
 #ifdef COLORIST_TIMING
         record_time(4);
@@ -211,19 +211,22 @@ public:
     }
 
 private:
+    struct UnionNode {
+        int parent;
+        std::uint32_t size;
+    };
+
 #ifdef COLORIST_TIMING
     std::array<double, 5> m_timings_ms{};
 #endif
 
     void ResetWorkingBuffers(int height) {
-        // Flat vectors retain capacity; parents and union sizes are recreated per run.
+        // Flat vectors retain capacity; each new node starts with its own parent and size 1.
         runs.clear();
-        connectivity.clear();
-        sizes.clear();
+        nodes.clear();
         const auto expected_runs = static_cast<std::size_t>(height) * 10;
         runs.reserve(expected_runs);
-        connectivity.reserve(expected_runs);
-        sizes.reserve(expected_runs);
+        nodes.reserve(expected_runs);
 
         // Keep every histogram's allocation and reset all counts, including root totals.
         // Only histogram entries indexed by the current runs are used by Compute().
@@ -234,9 +237,9 @@ private:
     }
 
     int Root(int p) {
-        while (p != connectivity[p]) {
-            connectivity[p] = connectivity[connectivity[p]];
-            p = connectivity[p];
+        while (p != nodes[p].parent) {
+            nodes[p].parent = nodes[nodes[p].parent].parent;
+            p = nodes[p].parent;
         }
         return p;
     }
@@ -248,12 +251,14 @@ private:
         if (root_p == root_q)
             return;
 
-        if (sizes[root_p] < sizes[root_q]) {
-            connectivity[root_p] = root_q;
-            sizes[root_q] += sizes[root_p];
+        auto& node_p = nodes[root_p];
+        auto& node_q = nodes[root_q];
+        if (node_p.size < node_q.size) {
+            node_p.parent = root_q;
+            node_q.size += node_p.size;
         } else {
-            connectivity[root_q] = root_p;
-            sizes[root_p] += sizes[root_q];
+            node_q.parent = root_p;
+            node_p.size += node_q.size;
         }
     }
 
@@ -270,8 +275,7 @@ private:
     }
 
     std::vector<Run> runs;
-    std::vector<int> connectivity;
-    std::vector<std::uint32_t> sizes;
+    std::vector<UnionNode> nodes;
     std::unordered_map<std::uint32_t, std::size_t> color_ids;
     std::vector<std::uint32_t> palette;
     std::vector<std::vector<std::size_t>> histogram;
