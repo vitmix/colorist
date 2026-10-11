@@ -22,9 +22,9 @@ MODES = ("sequential", "parallel")
 LIFECYCLES = ("reuse", "fresh")
 STAGES = ("threshold_ms", "ccl_ms", "histogram_ms", "color_selection_ms", "final_coloring_ms")
 STAGE_LABELS = ("Threshold", "CCL", "Histogram", "Selection", "Coloring")
-RLE_STAGES = ("setup_ms", "scan_ccl_histogram_ms", "histogram_aggregation_ms",
+RLE_STAGES = ("setup_ms", "scan_ccl_histogram_ms", "root_resolution_ms",
               "color_selection_ms", "final_coloring_ms")
-RLE_STAGE_LABELS = ("Setup", "Scan/CCL/hist", "Aggregation", "Selection", "Coloring")
+RLE_STAGE_LABELS = ("Setup", "Scan/CCL/hist", "Root resolution", "Selection", "Coloring")
 
 
 def timing_stages(metadata):

@@ -208,20 +208,20 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "Lifecycle: " << lifecycle
                   << (fresh ? " (Compute + instance destruction timed)\n" : " (Compute including reset timed)\n");
+        // Allocate once outside all timers. Each algorithm paints every pixel on every call.
+        cv::Mat result(mask.size(), CV_8UC4);
         for (int run = 0; run < warmup_runs; ++run) {
             auto warmup_algo = fresh ? CreateAlgo(algo_type) : nullptr;
-            (warmup_algo ? warmup_algo.get() : algo.get())->Compute(mask, color_mask);
+            (warmup_algo ? warmup_algo.get() : algo.get())->Compute(mask, color_mask, result);
         }
 
         std::vector<Measurement> measurements;
         measurements.reserve(measured_runs);
-        cv::Mat result;
         for (int run = 0; run < measured_runs; ++run) {
-            result.release(); // Match warm-up allocation behavior; exclude previous-image release.
             auto fresh_algo = fresh ? CreateAlgo(algo_type) : nullptr;
             auto* current_algo = fresh_algo ? fresh_algo.get() : algo.get();
             const auto start = std::chrono::steady_clock::now();
-            cv::Mat current = current_algo->Compute(mask, color_mask);
+            current_algo->Compute(mask, color_mask, result);
             const double elapsed_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
             Measurement measurement;
@@ -230,7 +230,7 @@ int main(int argc, char* argv[]) {
             measurement.stages_ms = current_algo->GetTimings();
 #endif
             if (fresh_algo) {
-                // Keep the returned image alive; time only algorithm instance/workspace destruction.
+                // The caller-owned output stays alive; time algorithm instance/workspace destruction.
                 const auto teardown_start = std::chrono::steady_clock::now();
                 fresh_algo.reset();
                 measurement.teardown_ms = std::chrono::duration<double, std::milli>(
@@ -238,7 +238,6 @@ int main(int argc, char* argv[]) {
                 measurement.total_ms += measurement.teardown_ms;
             }
             measurements.push_back(measurement);
-            result = std::move(current);
         }
         const double mean_ms = std::accumulate(measurements.begin(), measurements.end(), 0.0,
             [](double sum, const Measurement& sample) { return sum + sample.total_ms; }) / measured_runs;

@@ -10,7 +10,8 @@
 class IAlgo {
 public:
     virtual ~IAlgo() = default;
-    virtual cv::Mat Compute(const cv::Mat& mask, const cv::Mat& color_mask) = 0;
+    // Caller provides a CV_8UC4 output of the input size; every pixel is overwritten.
+    virtual void Compute(const cv::Mat& mask, const cv::Mat& color_mask, cv::Mat& output) = 0;
     virtual bool SupportsParallelLabeling() const { return false; }
 #ifdef COLORIST_TIMING
     virtual const std::array<double, 5>& GetTimings() const = 0;

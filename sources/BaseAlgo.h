@@ -63,12 +63,14 @@ public:
     }
 #endif
 
-    cv::Mat Compute(const cv::Mat &mask, const cv::Mat &color_mask) override
+    void Compute(const cv::Mat &mask, const cv::Mat &color_mask, cv::Mat& output) override
     {
         CV_Assert(mask.type() == CV_8UC1);
         CV_Assert(color_mask.type() == CV_8UC4);
         CV_Assert(mask.size() == color_mask.size());
         CV_Assert(!mask.empty());
+        CV_Assert(output.type() == CV_8UC4);
+        CV_Assert(output.size() == mask.size());
 
         const int height = mask.rows;
         const int width = mask.cols;
@@ -226,7 +228,6 @@ public:
 #ifdef COLORIST_TIMING
         stage_start = Clock::now();
 #endif
-        cv::Mat output(height, width, CV_8UC4);
         for (int y = 0; y < height; ++y)
         {
             const auto* lbl_base = labels.ptr<int>(y);
@@ -242,7 +243,6 @@ public:
 #ifdef COLORIST_TIMING
         record_time(4);
 #endif
-        return output;
     }
 
 private:

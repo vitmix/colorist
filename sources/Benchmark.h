@@ -46,6 +46,7 @@ inline void SaveMeasurements(const std::string& filename, const std::string& alg
     file << "schema_version" << 1 << "metadata" << "{"
          << "algorithm_requested" << algorithm
          << "lifecycle" << lifecycle
+         << "output_allocation_timed" << 0 << "output_buffer_reused" << 1
          << "algorithm_effective" << (algorithm == "base_bbdt" && connectivity == 4 ? "base_sauf" : algorithm)
          << "parallel_requested" << int(parallel_requested)
          << "parallel_labeling" << int(parallel_labeling)
