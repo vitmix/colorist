@@ -21,6 +21,13 @@ ALGORITHMS = ("base_spaghetti", "base_sauf", "base_bbdt")
 MODES = ("sequential", "parallel")
 STAGES = ("threshold_ms", "ccl_ms", "histogram_ms", "color_selection_ms", "final_coloring_ms")
 STAGE_LABELS = ("Threshold", "CCL", "Histogram", "Selection", "Coloring")
+RLE_STAGES = ("setup_ms", "scan_ccl_histogram_ms", "histogram_aggregation_ms",
+              "color_selection_ms", "final_coloring_ms")
+RLE_STAGE_LABELS = ("Setup", "Scan/CCL/hist", "Aggregation", "Selection", "Coloring")
+
+
+def timing_stages(metadata):
+    return RLE_STAGES if metadata.get("algorithm_requested") == "rle" else STAGES
 
 
 def summarize(values):
@@ -79,7 +86,12 @@ def validate_measurements(data, algorithm, mode, runs, warmup):
         raise ValueError("Benchmark requires debugging disabled: rebuild without -AlgoDebug / --algo-debug")
     if metadata["build_configuration"] not in ("Release", "RelWithDebInfo", "MinSizeRel"):
         raise ValueError("Benchmark requires an optimized build (e.g. Release)")
-    keys = ("total_ms",) + (STAGES if metadata["timing_enabled"] else ())
+    if algorithm == "rle" and metadata["parallel_labeling"]:
+        raise ValueError("RLE labeling must be sequential")
+    stages = timing_stages(metadata)
+    if metadata["timing_enabled"] and tuple(metadata.get("stage_keys", stages)) != stages:
+        raise ValueError("Unexpected timing stage keys")
+    keys = ("total_ms",) + (stages if metadata["timing_enabled"] else ())
     for sample in samples:
         for key in keys:
             value = sample[key]
@@ -154,7 +166,7 @@ def merge_batch(experiment, metadata, samples, job, comparison, result):
     experiment["statistics"] = summarize([sample["total_ms"] for sample in experiment["samples"]])
     experiment["stage_statistics"] = {
         stage: summarize([sample[stage] for sample in experiment["samples"]])
-        for stage in STAGES if metadata["timing_enabled"]
+        for stage in timing_stages(metadata) if metadata["timing_enabled"]
     }
     return experiment
 
@@ -179,6 +191,8 @@ def write_csv(path, rows):
 
 def save_reports(directory, context, experiments):
     summaries, raw, stages = [], [], []
+    all_stages = tuple(dict.fromkeys(stage for experiment in experiments
+                                    for stage in timing_stages(experiment["metadata"])))
     for experiment in experiments:
         metadata = experiment["metadata"]
         identity = {"algorithm": metadata["algorithm_requested"],
@@ -195,7 +209,7 @@ def save_reports(directory, context, experiments):
             raw.append({**identity, "iteration": iteration, "round": sample["round"],
                         "position": sample["position"], "iteration_in_round": sample["iteration_in_round"],
                         "total_ms": sample["total_ms"],
-                        **{stage: sample.get(stage, "") for stage in STAGES}})
+                        **{stage: sample.get(stage, "") for stage in all_stages}})
         for stage, values in experiment["stage_statistics"].items():
             stages.append({**identity, "stage": stage, **values})
     write_csv(directory / "summary.csv", summaries)
@@ -212,7 +226,7 @@ def parse_args():
     parser.add_argument("--exe", type=Path, default=Path("build/colorist.exe" if os.name == "nt" else "build/colorist"))
     parser.add_argument("--mask", type=Path, required=True)
     parser.add_argument("--color-mask", type=Path, required=True)
-    parser.add_argument("--algos", nargs="+", choices=ALGORITHMS, default=list(ALGORITHMS))
+    parser.add_argument("--algos", nargs="+", choices=ALGORITHMS + ("rle",), default=list(ALGORITHMS))
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--warmup", type=int, default=3, help="Warm-up runs per configuration per round (default: 3)")
     parser.add_argument("--runs", type=int, default=30, help="Total measured runs per configuration (default: 30)")
@@ -307,13 +321,16 @@ def main():
                      f"{stats['p95_ms']:.3f}", f"{stats['min_ms']:.3f}", f"{stats['max_ms']:.3f}",
                      comparison_label(experiment["comparison"])])
     print_table(["Algorithm", "Effective", "Mode", "Threads", "Runs", "Median", "Mean", "Stddev", "P95", "Min", "Max", "Reference"], rows)
-    stage_rows = [[experiment["metadata"]["algorithm_requested"].removeprefix("base_"), execution_label(experiment),
-                   *(f"{experiment['stage_statistics'][stage]['median_ms']:.3f}" for stage in STAGES)]
-                  for experiment in experiments if experiment["stage_statistics"]]
-    if stage_rows:
-        print("\nMedian stage times (ms):")
-        print_table(["Algorithm", "Mode", *STAGE_LABELS], stage_rows)
-    else:
+    for stages, labels, title in ((STAGES, STAGE_LABELS, "Median stage times (ms):"),
+                                  (RLE_STAGES, RLE_STAGE_LABELS, "Median RLE stage times (ms):")):
+        stage_rows = [[experiment["metadata"]["algorithm_requested"].removeprefix("base_"), execution_label(experiment),
+                       *(f"{experiment['stage_statistics'][stage]['median_ms']:.3f}" for stage in stages)]
+                      for experiment in experiments if experiment["stage_statistics"]
+                      and timing_stages(experiment["metadata"]) == stages]
+        if stage_rows:
+            print(f"\n{title}")
+            print_table(["Algorithm", "Mode", *labels], stage_rows)
+    if not any(experiment["stage_statistics"] for experiment in experiments):
         print("\nStage timings unavailable: rebuild with -AlgoTiming / --algo-timing.")
     print(f"\nResults, raw JSON, CSV statistics and report.json: {args.output_dir}")
     return 1 if any(experiment["comparison"] and not experiment["comparison"]["match"]

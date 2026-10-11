@@ -25,6 +25,7 @@ class BaseAlgo : public IAlgo
 {
 public:
     static constexpr int Connectivity = 4;
+    bool SupportsParallelLabeling() const override { return true; }
 
     void SetAlgoType(CclAlgoType type)
     {
@@ -32,9 +33,17 @@ public:
     }
 
 #ifdef COLORIST_TIMING
-    const std::array<double, 5>& GetTimings() const { return m_timings_ms; }
+    const std::array<double, 5>& GetTimings() const override { return m_timings_ms; }
 
-    void PrintTimings() const
+    const std::array<const char*, 5>& GetTimingKeys() const override
+    {
+        static constexpr std::array<const char*, 5> keys = {
+            "threshold_ms", "ccl_ms", "histogram_ms", "color_selection_ms", "final_coloring_ms"
+        };
+        return keys;
+    }
+
+    void PrintTimings() const override
     {
         static constexpr const char* stages[] = {
             "Threshold", "CCL", "Histogram", "Color selection", "Final coloring"

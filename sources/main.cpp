@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -17,6 +18,7 @@
 
 #include "BaseAlgo.h"
 #include "Benchmark.h"
+#include "RleAlgo.h"
 
 CclAlgoType GetCclAlgoType(const std::string& ccl_algo) {
     if (ccl_algo == "base_spaghetti") {
@@ -28,6 +30,15 @@ CclAlgoType GetCclAlgoType(const std::string& ccl_algo) {
     } else {
         throw std::runtime_error("Unknown algorithm: " + ccl_algo);
     }
+}
+
+std::unique_ptr<IAlgo> CreateAlgo(const std::string& name) {
+    if (name == "rle")
+        return std::make_unique<RleAlgo>();
+
+    auto algo = std::make_unique<BaseAlgo>();
+    algo->SetAlgoType(GetCclAlgoType(name));
+    return algo;
 }
 
 int ParseCount(const std::string& value, const char* option, int minimum) {
@@ -74,7 +85,7 @@ void ShowImageInfo(const cv::Mat& img) {
 int main(int argc, char* argv[]) {
     constexpr auto usage =
         "Usage: colorist --mask <mask.png> --color_mask <color_mask.png> --output <result.png>\n"
-        "                [--algo-type <base_spaghetti|base_sauf|base_bbdt>] [--parallel]\n"
+        "                [--algo-type <base_spaghetti|base_sauf|base_bbdt|rle>] [--parallel]\n"
         "                [--warmup <count>] [--runs <count>] [--metrics <measurements.json>]\n";
 
     if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
@@ -123,7 +134,7 @@ int main(int argc, char* argv[]) {
         if (algo_type.empty()) {
             algo_type = "base_spaghetti";
         }
-        const auto ccl_type = GetCclAlgoType(algo_type);
+        auto algo = CreateAlgo(algo_type);
         const int warmup_runs = warmup_arg.empty() ? 0 : ParseCount(warmup_arg, "--warmup", 0);
         const int measured_runs = runs_arg.empty() ? 1 : ParseCount(runs_arg, "--runs", 1);
         const auto absolute_path = [](const std::string& path) {
@@ -164,17 +175,17 @@ int main(int argc, char* argv[]) {
         }
 #endif
 
-        BaseAlgo algo;
-        algo.SetAlgoType(ccl_type);
-
-        cv::setNumThreads(parallel ? -1 : 1);
+        const bool supports_parallel = algo->SupportsParallelLabeling();
+        cv::setNumThreads(parallel && supports_parallel ? -1 : 1);
         const int thread_count = cv::getNumThreads();
         const int rows_per_thread = thread_count > 0 ? mask.rows / thread_count : 0;
         const bool enough_rows = thread_count > 0 && rows_per_thread >= 2;
-        const bool parallel_labeling = parallel && thread_count > 1 && enough_rows;
+        const bool parallel_labeling = supports_parallel && parallel && thread_count > 1 && enough_rows;
         std::cout << "Parallel requested: " << (parallel ? "yes" : "no")
                   << " -- OpenCV threads: " << thread_count << '\n';
-        if (thread_count > 0) {
+        if (!supports_parallel) {
+            std::cout << "RLE labeling is sequential; OpenCV's parallel row check does not apply.\n";
+        } else if (thread_count > 0) {
             std::cout << "Row check: image.rows / cv::getNumThreads() >= 2: "
                       << mask.rows << " / " << thread_count << " = " << rows_per_thread
                       << " >= 2 -> " << (enough_rows ? "PASS" : "FAIL") << '\n';
@@ -189,7 +200,7 @@ int main(int argc, char* argv[]) {
             std::cout << "Warm-up runs: " << warmup_runs << " -- measured runs: " << measured_runs << '\n';
         }
         for (int run = 0; run < warmup_runs; ++run)
-            algo.Compute(mask, color_mask);
+            algo->Compute(mask, color_mask);
 
         std::vector<Measurement> measurements;
         measurements.reserve(measured_runs);
@@ -197,13 +208,13 @@ int main(int argc, char* argv[]) {
         for (int run = 0; run < measured_runs; ++run) {
             result.release(); // Match warm-up allocation behavior; exclude previous-image release.
             const auto start = std::chrono::steady_clock::now();
-            cv::Mat current = algo.Compute(mask, color_mask);
+            cv::Mat current = algo->Compute(mask, color_mask);
             const double elapsed_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - start).count();
             Measurement measurement;
             measurement.total_ms = elapsed_ms;
 #ifdef COLORIST_TIMING
-            measurement.stages_ms = algo.GetTimings();
+            measurement.stages_ms = algo->GetTimings();
 #endif
             measurements.push_back(measurement);
             result = std::move(current);
@@ -214,14 +225,14 @@ int main(int argc, char* argv[]) {
 #ifdef COLORIST_TIMING
         if (measured_runs > 1)
             std::cout << "Stage timings for the last measured run:\n";
-        algo.PrintTimings();
+        algo->PrintTimings();
 #endif
 
         SaveImage(output_path, result);
         std::cout << "Saved " << output_path << '\n';
         if (!metrics_path.empty()) {
             SaveMeasurements(metrics_path, algo_type, parallel, parallel_labeling, thread_count,
-                             mask, BaseAlgo::Connectivity, warmup_runs, measurements);
+                             mask, BaseAlgo::Connectivity, warmup_runs, measurements, *algo);
             std::cout << "Saved " << metrics_path << '\n';
         }
         return 0;
