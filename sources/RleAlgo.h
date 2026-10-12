@@ -151,8 +151,13 @@ public:
                     // All unions for this run are complete; this histogram reference
                     // stays valid while the shared palette grows during color counting.
                     auto& hist = m_histograms[m_nodes[component_root].hist_id];
-                    for (int x = run_start; x < c; ++x) {
+                    int x = run_start;
+                    while (x < c) {
                         const auto color = PackColor(cmask_ptr[x]);
+                        const int stretch_start = x++;
+                        while (x < c && PackColor(cmask_ptr[x]) == color)
+                            ++x;
+
                         if (!cache_valid || color != prev_color) {
                             const auto [entry, inserted] = m_color_ids.try_emplace(color, m_palette.size());
                             if (inserted) {
@@ -165,7 +170,7 @@ public:
                         if (hist.size() <= prev_color_id) {
                             hist.resize(prev_color_id + 1);
                         }
-                        ++hist[prev_color_id];
+                        hist[prev_color_id] += static_cast<std::size_t>(x - stretch_start);
                     }
 
                     std::fill(out_ptr + run_start + 1, out_ptr + run_end + 1, transparent);
