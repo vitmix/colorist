@@ -70,11 +70,17 @@ public:
         };
 #endif
 
-        const cv::Vec4b black(0, 0, 0, 255), transparent(0, 0, 0, 0);
+        const cv::Vec4b black(0, 0, 0, 255);
 
         int height = mask.rows;
         int width = mask.cols;
         ResetWorkingBuffers(height);
+
+        // Before the fallback boundary, markers contain both the component ID and
+        // run length. After it, they contain full IDs and coloring reads the mask.
+        bool packed_runs = width <= static_cast<int>(MaxRunLength);
+        int packed_stop_y = packed_runs ? height : 0;
+        int packed_stop_x = 0;
 
         int prev_row_begin = 0, prev_row_stop = 0;
         int cursor = 0;
@@ -173,8 +179,19 @@ public:
                         hist[prev_color_id] += static_cast<std::size_t>(x - stretch_start);
                     }
 
-                    std::fill(out_ptr + run_start + 1, out_ptr + run_end + 1, transparent);
-                    out_ptr[run_start] = PackComponentId(component_root);
+                    if (packed_runs) {
+                        const auto metadata = PackRunMetadata(component_root, c - run_start);
+                        if (static_cast<std::uint32_t>(component_root) > ComponentIdMask ||
+                            metadata == BackgroundMarker) {
+                            packed_runs = false;
+                            packed_stop_y = y;
+                            packed_stop_x = run_start;
+                        } else {
+                            out_ptr[run_start] = UnpackColor(metadata);
+                        }
+                    } else {
+                        out_ptr[run_start] = PackComponentId(component_root);
+                    }
                 } else {
                     out_ptr[c] = black;
                     ++c;
@@ -218,26 +235,45 @@ public:
         record_time(3);
 #endif
 
-        // Before painting, foreground has alpha 0 (interiors) or <= 127 (nonnegative
-        // component IDs); background has alpha 255. Find each span before overwriting
-        // its temporary markers, since the final color can have any alpha.
+        // Jump over unwritten run interiors using their packed lengths. Every
+        // position examined is either a run-start marker or initialized background.
         for (int y = 0; y < height; ++y) {
             auto* out_ptr = output.ptr<cv::Vec4b>(y);
+            const int packed_width = y < packed_stop_y ? width :
+                y == packed_stop_y ? packed_stop_x : 0;
             int c = 0;
 
-            while (c < width) {
-                while (c < width && out_ptr[c][3] == 255)
+            while (c < packed_width) {
+                while (c < packed_width && PackColor(out_ptr[c]) == BackgroundMarker)
                     ++c;
-                if (c == width)
+                if (c == packed_width)
                     break;
 
                 const int run_start = c;
-                const int component_id = UnpackComponentId(out_ptr[run_start]);
+                const auto metadata = PackColor(out_ptr[run_start]);
+                const int component_id = static_cast<int>(metadata & ComponentIdMask);
+                c += static_cast<int>(metadata >> ComponentIdBits);
                 const cv::Vec4b color = UnpackColor(m_histograms[m_nodes[component_id].hist_id][0]);
-
-                while (c < width && out_ptr[c][3] != 255)
-                    ++c;
                 std::fill(out_ptr + run_start, out_ptr + c, color);
+            }
+
+            // Wide images, excessive component IDs, or a reserved-marker collision
+            // use full-ID markers and mask boundaries, without clearing interiors.
+            if (c < width) {
+                const auto* mask_ptr = mask.ptr<uchar>(y);
+                while (c < width) {
+                    while (c < width && mask_ptr[c] <= 127)
+                        ++c;
+                    if (c == width)
+                        break;
+
+                    const int run_start = c;
+                    const int component_id = UnpackComponentId(out_ptr[run_start]);
+                    const cv::Vec4b color = UnpackColor(m_histograms[m_nodes[component_id].hist_id][0]);
+                    while (c < width && mask_ptr[c] > 127)
+                        ++c;
+                    std::fill(out_ptr + run_start, out_ptr + c, color);
+                }
             }
         }
 #ifdef COLORIST_TIMING
@@ -246,6 +282,16 @@ public:
     }
 
 private:
+    static constexpr unsigned ComponentIdBits = 20;
+    static constexpr std::uint32_t ComponentIdMask = (std::uint32_t{1} << ComponentIdBits) - 1;
+    static constexpr std::uint32_t MaxRunLength = (std::uint32_t{1} << (32 - ComponentIdBits)) - 1;
+    static constexpr std::uint32_t BackgroundMarker = 0xFF000000u;
+
+    static std::uint32_t PackRunMetadata(int component_id, int length) {
+        return static_cast<std::uint32_t>(component_id) |
+            (static_cast<std::uint32_t>(length) << ComponentIdBits);
+    }
+
     struct UnionNode {
         int parent;
         std::uint32_t size;
