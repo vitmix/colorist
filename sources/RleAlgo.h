@@ -87,10 +87,9 @@ public:
         record_time(0);
 #endif
 
-        std::vector<std::size_t> temp_hist;
         std::vector<Run> prev_run_row, curr_run_row;
 
-        // Scan run statistics and combine component histograms during connectivity updates.
+        // Resolve run connectivity before counting its colors directly into the root.
         for (int y = 0; y < height; ++y) {
 
             const auto* mask_ptr = mask.ptr<uchar>(y);
@@ -104,30 +103,10 @@ public:
             while (c < width) {
                 if (mask_ptr[c] > 127) {
 
-                    std::fill(temp_hist.begin(), temp_hist.end(), 0);
-
                     int run_start = c;
-                    while (c < width && mask_ptr[c] > 127) {
-                        auto color = PackColor(cmask_ptr[c]);
-
-                        if (!cache_valid || color != prev_color) {
-                            const auto [entry, inserted] = m_color_ids.try_emplace(color, m_palette.size());
-                            if (inserted) {
-                                m_palette.push_back(color);
-                            }
-                            prev_color = color;
-                            prev_color_id = entry->second;
-                            cache_valid = true;
-                        }
-                        if (temp_hist.size() <= prev_color_id) {
-                            temp_hist.resize(prev_color_id + 1);
-                        }
-                        ++temp_hist[prev_color_id];
+                    while (c < width && mask_ptr[c] > 127)
                         ++c;
-                    }
                     int run_end = c - 1;
-
-                    std::fill(out_ptr + run_start + 1, out_ptr + run_end + 1, transparent);
 
                     const int run_id = static_cast<int>(m_nodes.size());
                     curr_run_row.push_back({ -1, run_start, run_end });
@@ -169,9 +148,28 @@ public:
 
                     curr_run_row.back().id = component_root;
 
-                    out_ptr[run_start] = PackComponentId(component_root);
+                    // All unions for this run are complete; this histogram reference
+                    // stays valid while the shared palette grows during color counting.
+                    auto& hist = m_histograms[m_nodes[component_root].hist_id];
+                    for (int x = run_start; x < c; ++x) {
+                        const auto color = PackColor(cmask_ptr[x]);
+                        if (!cache_valid || color != prev_color) {
+                            const auto [entry, inserted] = m_color_ids.try_emplace(color, m_palette.size());
+                            if (inserted) {
+                                m_palette.push_back(color);
+                            }
+                            prev_color = color;
+                            prev_color_id = entry->second;
+                            cache_valid = true;
+                        }
+                        if (hist.size() <= prev_color_id) {
+                            hist.resize(prev_color_id + 1);
+                        }
+                        ++hist[prev_color_id];
+                    }
 
-                    MergeHist(m_histograms[m_nodes[component_root].hist_id], temp_hist);
+                    std::fill(out_ptr + run_start + 1, out_ptr + run_end + 1, transparent);
+                    out_ptr[run_start] = PackComponentId(component_root);
                 } else {
                     out_ptr[c] = black;
                     ++c;
