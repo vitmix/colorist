@@ -2,6 +2,8 @@
 
 #include "IAlgo.h"
 
+#include <opencv2/core/simd_intrinsics.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -98,6 +100,10 @@ public:
         record_time(0);
 #endif
 
+        int mask_block_sz = cv::v_uint8().nlanes;
+        int color_block_sz = cv::v_uint32().nlanes;
+        const cv::v_uint8 cmp_block = cv::vx_setall_u8(127);
+        
         std::vector<Run> prev_run_row, curr_run_row;
 
         // Resolve run connectivity before counting its colors directly into the root.
@@ -114,10 +120,25 @@ public:
             while (c < width) {
                 if (mask_ptr[c] > 127) {
 
-                    int run_start = c;
-                    while (c < width && mask_ptr[c] > 127)
+                    const int run_start = c;
+                    
+                    while (width - c >= mask_block_sz) {
+                        const auto batch = cv::vx_load(mask_ptr + c);
+                        const auto background = cv::v_le(batch, cmp_block);
+
+                        if (cv::v_check_any(background)) {
+                            c += cv::v_scan_forward(background);
+                            break;
+                        }
+
+                        c += mask_block_sz;
+                    }
+
+                    while (c < width && mask_ptr[c] > 127) {
                         ++c;
-                    int run_end = c - 1;
+                    }
+
+                    const int run_end = c - 1;
 
                     const int run_id = static_cast<int>(m_nodes.size());
                     curr_run_row.push_back({ -1, run_start, run_end });
@@ -165,7 +186,22 @@ public:
                     int x = run_start;
                     while (x < c) {
                         const auto color = PackColor(cmask_ptr[x]);
+                        const auto repeated_color = cv::vx_setall_u32(color);
                         const int stretch_start = x++;
+
+                        while (c - x >= color_block_sz) {
+                            const auto pixels = cv::v_reinterpret_as_u32(
+                                cv::vx_load(reinterpret_cast<const uchar*>(cmask_ptr + x)));
+                            
+                            const auto mismatches = cv::v_ne(pixels, repeated_color);
+                            if (cv::v_check_any(mismatches)) {
+                                x += cv::v_scan_forward(mismatches);
+                                break;
+                            }
+
+                            x += color_block_sz;
+                        }
+
                         while (x < c && PackColor(cmask_ptr[x]) == color)
                             ++x;
 
