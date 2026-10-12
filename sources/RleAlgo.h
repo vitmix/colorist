@@ -189,7 +189,8 @@ public:
                         } else {
                             out_ptr[run_start] = UnpackColor(metadata);
                         }
-                    } else {
+                    }
+                    if (!packed_runs) {
                         out_ptr[run_start] = PackComponentId(component_root);
                     }
                 } else {
