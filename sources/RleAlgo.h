@@ -18,7 +18,7 @@
 class RleAlgo : public IAlgo {
 public:
     struct Run {
-        int y;
+        int id;
         int x0;
         int x1;
     };
@@ -70,6 +70,8 @@ public:
         };
 #endif
 
+        const cv::Vec4b black(0, 0, 0, 255), transparent(0, 0, 0, 0);
+
         int height = mask.rows;
         int width = mask.cols;
         ResetWorkingBuffers(height);
@@ -86,15 +88,16 @@ public:
 #endif
 
         std::vector<std::size_t> temp_hist;
+        std::vector<Run> prev_run_row, curr_run_row;
 
         // Scan run statistics and combine component histograms during connectivity updates.
         for (int y = 0; y < height; ++y) {
 
             const auto* mask_ptr = mask.ptr<uchar>(y);
             const auto* cmask_ptr = color_mask.ptr<cv::Vec4b>(y);
+            auto* out_ptr = output.ptr<cv::Vec4b>(y);
 
             int c = 0;
-            int curr_row_start = static_cast<int>(m_runs.size());
 
             cursor = prev_row_begin;
 
@@ -124,15 +127,16 @@ public:
                     }
                     int run_end = c - 1;
 
-                    const int run_id = static_cast<int>(m_runs.size());
-                    m_runs.push_back({ y, run_start, run_end });
-                    m_nodes.push_back({run_id, 1, -1});
+                    std::fill(out_ptr + run_start + 1, out_ptr + run_end + 1, transparent);
+
+                    const int run_id = static_cast<int>(m_nodes.size());
+                    curr_run_row.push_back({ -1, run_start, run_end });
 
                     int component_root = -1;
 
-                    const Run& curr_run = m_runs.back();
+                    const Run& curr_run = curr_run_row.back();
                     while (cursor != prev_row_stop) {
-                        const Run& prev_run = m_runs[cursor];
+                        const Run& prev_run = prev_run_row[cursor];
 
                         if (prev_run.x1 < curr_run.x0) {
                             ++cursor; // Previous run ends before current starts
@@ -142,11 +146,10 @@ public:
                             break;
                         }
 
-                        const auto prev_root = Root(cursor);
+                        const auto prev_root = Root(prev_run.id);
 
                         if (component_root == -1) {
                             component_root = prev_root;
-                            m_nodes[run_id].parent = component_root;
                             m_nodes[component_root].size++;
                         } else {
                             component_root = UnionAndMergeHist(component_root, prev_root);
@@ -161,38 +164,44 @@ public:
 
                     if (component_root == -1) {
                         component_root = run_id;
-                        m_nodes[component_root].hist_id = AcquireHistogramSlot();
+                        m_nodes.push_back({component_root, 1, AcquireHistogramSlot()});
                     }
 
-                    MergeHist(m_histograms[m_nodes[component_root].hist_id], temp_hist);
+                    curr_run_row.back().id = component_root;
 
+                    out_ptr[run_start] = PackComponentId(component_root);
+
+                    MergeHist(m_histograms[m_nodes[component_root].hist_id], temp_hist);
                 } else {
+                    out_ptr[c] = black;
                     ++c;
                 }
             }
-            prev_row_begin = curr_row_start;
-            prev_row_stop = static_cast<int>(m_runs.size());
+            std::swap(prev_run_row, curr_run_row);
+            curr_run_row.clear();
+            prev_row_begin = 0;
+            prev_row_stop = static_cast<int>(prev_run_row.size());
         }
 #ifdef COLORIST_TIMING
         record_time(1);
 #endif
 
         // Histograms are already aggregated; resolve every run's final root for coloring.
-        for (std::size_t run_id = 0; run_id < m_nodes.size(); ++run_id) {
-            const auto root = Root(static_cast<int>(run_id));
-            m_nodes[run_id].parent = root; // Cache the final root for selection and coloring.
+        for (std::size_t comp_id = 0; comp_id < m_nodes.size(); ++comp_id) {
+            const auto root = Root(static_cast<int>(comp_id));
+            m_nodes[comp_id].parent = root; // Cache the final root for selection and coloring.
+            m_nodes[comp_id].hist_id = m_nodes[root].hist_id;
         }
 #ifdef COLORIST_TIMING
         record_time(2);
 #endif
 
         // Select a winner once per root, including valid packed color zero.
-        std::vector<cv::Vec4b> final_colors(m_runs.size());
         for (std::size_t run_id = 0; run_id < m_nodes.size(); ++run_id) {
             if (m_nodes[run_id].parent != static_cast<int>(run_id))
                 continue;
 
-            const auto& hist = m_histograms[m_nodes[run_id].hist_id];
+            auto& hist = m_histograms[m_nodes[run_id].hist_id];
             std::size_t best = 0;
             for (std::size_t h = 1; h < hist.size(); ++h) {
                 if (hist[h] > hist[best] ||
@@ -200,28 +209,33 @@ public:
                     best = h;
                 }
             }
-            final_colors[run_id] = UnpackColor(m_palette[best]);
+            hist[0] = m_palette[best];
         }
 #ifdef COLORIST_TIMING
         record_time(3);
 #endif
 
-        // Runs are ordered by row and x. Paint gaps and runs once, without a whole-image clear.
-        const cv::Vec4b black(0, 0, 0, 255);
-        std::size_t run_index = 0;
+        // Before painting, foreground has alpha 0 (interiors) or <= 127 (nonnegative
+        // component IDs); background has alpha 255. Find each span before overwriting
+        // its temporary markers, since the final color can have any alpha.
         for (int y = 0; y < height; ++y) {
-            auto* row = output.ptr<cv::Vec4b>(y);
-            int next_x = 0;
-            while (run_index < m_runs.size() && m_runs[run_index].y == y) {
-                const auto& run = m_runs[run_index];
-                std::fill(row + next_x, row + run.x0, black);
-                const auto color = final_colors[m_nodes[run_index].parent];
-                std::fill(row + run.x0, row + run.x1 + 1, color);
-                next_x = run.x1 + 1;
-                ++run_index;
+            auto* out_ptr = output.ptr<cv::Vec4b>(y);
+            int c = 0;
+
+            while (c < width) {
+                while (c < width && out_ptr[c][3] == 255)
+                    ++c;
+                if (c == width)
+                    break;
+
+                const int run_start = c;
+                const int component_id = UnpackComponentId(out_ptr[run_start]);
+                const cv::Vec4b color = UnpackColor(m_histograms[m_nodes[component_id].hist_id][0]);
+
+                while (c < width && out_ptr[c][3] != 255)
+                    ++c;
+                std::fill(out_ptr + run_start, out_ptr + c, color);
             }
-            // Also covers completely empty rows and pixels after the last run.
-            std::fill(row + next_x, row + width, black);
         }
 #ifdef COLORIST_TIMING
         record_time(4);
@@ -241,10 +255,8 @@ private:
 
     void ResetWorkingBuffers(int height) {
         // Flat vectors retain capacity; each new node starts with its own parent and size 1.
-        m_runs.clear();
         m_nodes.clear();
         const auto expected_runs = static_cast<std::size_t>(height) * 10;
-        m_runs.reserve(expected_runs);
         m_nodes.reserve(expected_runs);
 
         // Previous roots no longer exist; every retained slot is available exactly once.
@@ -344,7 +356,16 @@ private:
                         static_cast<uchar>(color >> 16), static_cast<uchar>(color >> 24));
     }
 
-    std::vector<Run> m_runs;
+    static cv::Vec4b PackComponentId(int component_id) {
+        return cv::Vec4b(static_cast<uchar>(component_id), static_cast<uchar>(component_id >> 8),
+                         static_cast<uchar>(component_id >> 16), static_cast<uchar>(component_id>> 24));
+    }
+
+    static int UnpackComponentId(const cv::Vec4b& packed_root) {
+        return int(packed_root[0]) | (int(packed_root[1]) << 8) |
+              (int(packed_root[2]) << 16) | (int(packed_root[3]) << 24);
+    }
+
     std::vector<UnionNode> m_nodes;
     std::unordered_map<std::uint32_t, std::size_t> m_color_ids;
     std::vector<std::uint32_t> m_palette;
