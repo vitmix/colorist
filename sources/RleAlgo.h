@@ -3,12 +3,12 @@
 #include "IAlgo.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <limits>
 #include <vector>
-#include <unordered_map>
 
 #ifdef COLORIST_TIMING
-#include <array>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
@@ -59,6 +59,11 @@ public:
         CV_Assert(!mask.empty());
         CV_Assert(output.type() == CV_8UC4);
         CV_Assert(output.size() == mask.size());
+        // Every bin and every merged component count is bounded by image area.
+        if (static_cast<std::uint64_t>(mask.rows) * static_cast<std::uint64_t>(mask.cols) >
+            std::numeric_limits<std::uint32_t>::max()) {
+            CV_Error(cv::Error::StsOutOfRange, "Image exceeds the 32-bit histogram counter limit");
+        }
 
 #ifdef COLORIST_TIMING
         using Clock = std::chrono::steady_clock;
@@ -165,18 +170,14 @@ public:
                             ++x;
 
                         if (!cache_valid || color != prev_color) {
-                            const auto [entry, inserted] = m_color_ids.try_emplace(color, m_palette.size());
-                            if (inserted) {
-                                m_palette.push_back(color);
-                            }
                             prev_color = color;
-                            prev_color_id = entry->second;
+                            prev_color_id = GetColorId(color);
                             cache_valid = true;
                         }
                         if (hist.size() <= prev_color_id) {
                             hist.resize(prev_color_id + 1);
                         }
-                        hist[prev_color_id] += static_cast<std::size_t>(x - stretch_start);
+                        hist[prev_color_id] += static_cast<std::uint32_t>(x - stretch_start);
                     }
 
                     if (packed_runs) {
@@ -283,6 +284,50 @@ public:
     }
 
 private:
+    // Resolve recurring colors through the cache before searching the sorted lookup.
+    static constexpr bool UseColorCache = true;
+    static constexpr std::size_t ColorCacheSize = 64;
+    static_assert(ColorCacheSize != 0 && (ColorCacheSize & (ColorCacheSize - 1)) == 0,
+        "Color cache size must be a power of two");
+    struct ColorCacheEntry {
+        std::uint32_t color{};
+        std::uint32_t id{};
+        bool valid{false};
+    };
+
+    std::size_t GetColorId(std::uint32_t color) {
+        if constexpr (UseColorCache) {
+            // Mix all BGRA bytes into a slot. A full-key check makes collisions safe.
+            const std::uint32_t mixed = (color ^ (color >> 16)) * 0x9E3779B1u;
+            auto& cached = m_color_cache[(mixed ^ (mixed >> 16)) & (ColorCacheSize - 1)];
+            if (!cached.valid || cached.color != color)
+                cached = {color, FindOrInsertColorId(color), true};
+            return cached.id;
+        }
+        return FindOrInsertColorId(color);
+    }
+
+    struct ColorIdEntry {
+        std::uint32_t color;
+        std::uint32_t id;
+    };
+
+    std::uint32_t FindOrInsertColorId(std::uint32_t color) {
+        const auto entry = std::lower_bound(m_color_ids.begin(), m_color_ids.end(), color,
+            [](const ColorIdEntry& candidate, std::uint32_t value) {
+                return candidate.color < value;
+            });
+        if (entry != m_color_ids.end() && entry->color == color)
+            return entry->id;
+
+        // Sorted positions may change; histogram IDs index the append-only palette.
+        // Packed BGRA has at most 2^32 colors, so every palette ID fits in 32 bits.
+        const auto id = static_cast<std::uint32_t>(m_palette.size());
+        m_palette.push_back(color);
+        m_color_ids.insert(entry, {color, id});
+        return id;
+    }
+
     static constexpr unsigned ComponentIdBits = 20;
     static constexpr std::uint32_t ComponentIdMask = (std::uint32_t{1} << ComponentIdBits) - 1;
     static constexpr std::uint32_t MaxRunLength = (std::uint32_t{1} << (32 - ComponentIdBits)) - 1;
@@ -316,7 +361,7 @@ private:
         for (std::size_t i = 0; i < m_histograms.size(); ++i)
             m_free_hist_slots.push_back(static_cast<int>(i));
 
-        // m_color_ids and m_palette intentionally retain their shared, stable color IDs.
+        // Sorted lookup, palette and optional cache retain their shared, stable IDs.
     }
 
     int AcquireHistogramSlot() {
@@ -329,7 +374,7 @@ private:
             m_free_hist_slots.pop_back();
         }
         auto& hist = m_histograms[hist_id];
-        std::fill(hist.begin(), hist.end(), std::size_t{0});
+        std::fill(hist.begin(), hist.end(), std::uint32_t{0});
         return hist_id;
     }
 
@@ -359,7 +404,7 @@ private:
         }
     }
 
-    void MergeHist(std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+    void MergeHist(std::vector<std::uint32_t>& a, const std::vector<std::uint32_t>& b) {
         if (a.size() < b.size()) {
             a.resize(b.size());
         }
@@ -417,8 +462,9 @@ private:
     }
 
     std::vector<UnionNode> m_nodes;
-    std::unordered_map<std::uint32_t, std::size_t> m_color_ids;
+    std::array<ColorCacheEntry, ColorCacheSize> m_color_cache{};
+    std::vector<ColorIdEntry> m_color_ids;
     std::vector<std::uint32_t> m_palette;
-    std::vector<std::vector<std::size_t>> m_histograms;
+    std::vector<std::vector<std::uint32_t>> m_histograms;
     std::vector<int> m_free_hist_slots;
 };
