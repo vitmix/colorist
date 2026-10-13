@@ -101,8 +101,8 @@ public:
         record_time(0);
 #endif
 
-        const int mask_block_sz = cv::v_uint8().nlanes;
-        const int color_block_sz = cv::v_uint32().nlanes;
+        const int mask_block_sz = cv::VTraits<cv::v_uint8>::vlanes();
+        const int color_block_sz = cv::VTraits<cv::v_uint32>::vlanes();
         const cv::v_uint8 cmp_block = cv::vx_setall_u8(127);
 
         cv::parallel_for_(cv::Range(0, stripe_count),
