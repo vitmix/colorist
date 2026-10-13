@@ -19,6 +19,8 @@
 
 class RleAlgo : public IAlgo {
 public:
+    explicit RleAlgo(int num_threads = 1) { SetNumThreads(num_threads); }
+
     bool SupportsParallelColoring() const override { return true; }
 
     void SetNumThreads(int num_threads) override {
@@ -283,8 +285,7 @@ public:
         // Jump over unwritten run interiors using their packed lengths. Every
         // position examined is either a run-start marker or initialized background.
 
-        cv::parallel_for_(
-            cv::Range(0, height),
+        cv::parallel_for_(cv::Range(0, height),
             [&](const cv::Range& range) {
                 for (int row_id = range.start; row_id < range.end; ++row_id) {
                     auto* out_ptr = output.ptr<cv::Vec4b>(row_id);
@@ -325,8 +326,7 @@ public:
                         }
                     }
                 }
-            },
-            m_num_threads
+            }, m_num_threads
         );
 
 #ifdef COLORIST_TIMING

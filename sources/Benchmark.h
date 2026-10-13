@@ -51,6 +51,7 @@ inline void SaveMeasurements(const std::string& filename, const std::string& alg
          << "parallel_requested" << int(parallel_requested)
          << "parallel_labeling" << int(parallel_labeling)
          << "parallel_coloring" << int(parallel_coloring)
+         << "coloring_backend" << (parallel_coloring ? backend : "sequential")
          << "opencv_threads" << threads << "parallel_backend" << backend
          << "connectivity" << connectivity << "image_width" << mask.cols << "image_height" << mask.rows
          << "foreground_threshold" << 127

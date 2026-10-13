@@ -34,9 +34,7 @@ CclAlgoType GetCclAlgoType(const std::string& ccl_algo) {
 
 std::unique_ptr<IAlgo> CreateAlgo(const std::string& name, int num_threads = 1) {
     if (name == "rle") {
-        auto algo = std::make_unique<RleAlgo>();
-        algo->SetNumThreads(num_threads);
-        return algo;
+        return std::make_unique<RleAlgo>(num_threads);
     }
 
     auto algo = std::make_unique<BaseAlgo>();
@@ -214,6 +212,7 @@ int main(int argc, char* argv[]) {
                   << '\n';
         std::cout << "Final coloring: "
                   << (parallel_coloring ? "parallel version running" : "sequential version running")
+                  << (parallel_coloring ? " (OpenCV parallel_for_)" : "")
                   << '\n';
 
         if (warmup_runs > 0 || measured_runs > 1) {
