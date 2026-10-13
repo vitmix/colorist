@@ -24,7 +24,7 @@ STAGES = ("threshold_ms", "ccl_ms", "histogram_ms", "color_selection_ms", "final
 STAGE_LABELS = ("Threshold", "CCL", "Histogram", "Selection", "Coloring")
 RLE_STAGES = ("setup_ms", "scan_ccl_histogram_ms", "root_resolution_ms",
               "color_selection_ms", "final_coloring_ms")
-RLE_STAGE_LABELS = ("Setup", "Scan/CCL/hist", "Root resolution", "Selection", "Coloring")
+RLE_STAGE_LABELS = ("Setup", "Scan/CCL/hist", "Reconciliation", "Selection", "Coloring")
 
 
 def timing_stages(metadata):
@@ -89,8 +89,6 @@ def validate_measurements(data, algorithm, mode, runs, warmup, lifecycle="reuse"
         raise ValueError("Benchmark requires debugging disabled: rebuild without -AlgoDebug / --algo-debug")
     if metadata["build_configuration"] not in ("Release", "RelWithDebInfo", "MinSizeRel"):
         raise ValueError("Benchmark requires an optimized build (e.g. Release)")
-    if algorithm == "rle" and metadata["parallel_labeling"]:
-        raise ValueError("RLE labeling must be sequential")
     stages = timing_stages(metadata)
     if metadata["timing_enabled"] and tuple(metadata.get("stage_keys", stages)) != stages:
         raise ValueError("Unexpected timing stage keys")

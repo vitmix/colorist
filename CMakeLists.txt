@@ -8,6 +8,10 @@ list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/.deps/opencv")
 find_package(OpenCV 4.14 REQUIRED COMPONENTS core imgproc imgcodecs)
 
 add_executable(colorist sources/main.cpp)
+if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    target_compile_options(colorist PRIVATE -g -gcodeview)
+    target_link_options(colorist PRIVATE "-Wl,--pdb=colorist.pdb")
+endif()
 
 include(cmake/simd.cmake)
 colorist_select_simd(colorist)

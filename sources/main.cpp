@@ -4,6 +4,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <charconv>
 #include <cerrno>
@@ -188,18 +189,21 @@ int main(int argc, char* argv[]) {
 #endif
 
         const bool supports_parallel = algo->SupportsParallelLabeling();
+        const bool stripe_labeling = algo_type == "rle";
         const bool supports_parallel_coloring = algo->SupportsParallelColoring();
         cv::setNumThreads(parallel && (supports_parallel || supports_parallel_coloring) ? requested_threads : 1);
         const int thread_count = cv::getNumThreads();
         algo->SetNumThreads(thread_count);
         const int rows_per_thread = thread_count > 0 ? mask.rows / thread_count : 0;
         const bool enough_rows = thread_count > 0 && rows_per_thread >= 2;
-        const bool parallel_labeling = supports_parallel && parallel && thread_count > 1 && enough_rows;
+        const bool parallel_labeling = supports_parallel && parallel && thread_count > 1 &&
+            (stripe_labeling ? mask.rows > 1 : enough_rows);
         const bool parallel_coloring = supports_parallel_coloring && parallel && thread_count > 1 && mask.rows > 1;
         std::cout << "Parallel requested: " << (parallel ? "yes" : "no")
                   << " -- OpenCV threads: " << thread_count << '\n';
-        if (!supports_parallel) {
-            std::cout << "RLE labeling is sequential; OpenCV's parallel row check does not apply.\n";
+        if (stripe_labeling) {
+            std::cout << "RLE stripes: " << std::min(mask.rows, thread_count)
+                      << " -- boundary reconciliation: sequential\n";
         } else if (thread_count > 0) {
             std::cout << "Row check: image.rows / cv::getNumThreads() >= 2: "
                       << mask.rows << " / " << thread_count << " = " << rows_per_thread

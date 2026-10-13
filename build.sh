@@ -16,6 +16,10 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 tools="$root/.tools"
 deps="$root/.deps"
 jobs=${JOBS:-$(getconf _NPROCESSORS_ONLN)}
+case "$jobs" in
+    ''|*[!0-9]*) printf 'JOBS must be a positive integer\n' >&2; exit 1 ;;
+esac
+[ "$jobs" -gt 0 ] || { printf 'JOBS must be a positive integer\n' >&2; exit 1; }
 mkdir -p "$tools" "$deps"
 
 download() {
@@ -30,9 +34,10 @@ download() {
     fi
 }
 
-case $(uname -m) in
-    x86_64|amd64) cmake_name=cmake-4.4.4-linux-x86_64 ;;
-    aarch64|arm64) cmake_name=cmake-4.4.4-linux-aarch64 ;;
+# A Pi can run a 64-bit kernel with 32-bit userland: uname alone is insufficient.
+case "$(uname -m)/$(getconf LONG_BIT)" in
+    x86_64/64|amd64/64) cmake_name=cmake-4.4.4-linux-x86_64 ;;
+    aarch64/64|arm64/64) cmake_name=cmake-4.4.4-linux-aarch64 ;;
     *) cmake_name=cmake-4.4.4 ;; # 32-bit ARM and other CPUs: build CMake natively.
 esac
 cmake="$tools/$cmake_name/bin/cmake"
