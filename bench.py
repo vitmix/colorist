@@ -129,7 +129,10 @@ def comparison_label(comparison):
 
 def execution_label(experiment):
     requested = experiment["mode"]
-    actual = "parallel" if experiment["metadata"]["parallel_labeling"] else "sequential"
+    metadata = experiment["metadata"]
+    if requested == "parallel" and metadata.get("parallel_coloring") and not metadata["parallel_labeling"]:
+        return "parallel (coloring)"
+    actual = "parallel" if metadata["parallel_labeling"] or metadata.get("parallel_coloring") else "sequential"
     return requested if requested == actual else f"{requested} -> {actual}"
 
 
@@ -216,6 +219,7 @@ def save_reports(directory, context, experiments):
                     "mode": experiment["mode"],
                     "lifecycle": experiment["lifecycle"],
                     "labeling": "parallel" if metadata["parallel_labeling"] else "sequential",
+                    "coloring": "parallel" if metadata.get("parallel_coloring") else "sequential",
                     "threads": metadata["opencv_threads"], "rounds": len(experiment["rounds"])}
         comparison = experiment["comparison"]
         summaries.append({**identity, "runs": len(experiment["samples"]),
@@ -248,6 +252,7 @@ def parse_args():
     parser.add_argument("--color-mask", type=Path, required=True)
     parser.add_argument("--algos", nargs="+", choices=ALGORITHMS + ("rle",), default=list(ALGORITHMS))
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
+    parser.add_argument("--threads", type=int, help="OpenCV thread count for parallel experiments (default: automatic)")
     parser.add_argument("--lifecycles", nargs="+", choices=LIFECYCLES, default=list(LIFECYCLES),
                         help="Instance reuse/fresh modes (default: both)")
     parser.add_argument("--warmup", type=int, default=3, help="Warm-up runs per configuration per round (default: 3)")
@@ -260,6 +265,10 @@ def parse_args():
     args = parser.parse_args()
     if args.runs < 1 or args.warmup < 0 or args.rounds < 1:
         parser.error("--runs and --rounds must be >= 1 and --warmup must be >= 0")
+    if args.threads is not None and not 1 <= args.threads <= 2147483647:
+        parser.error("--threads must be an integer between 1 and 2147483647")
+    if args.threads is not None and "parallel" not in args.modes:
+        parser.error("--threads requires a parallel mode")
     for name in ("exe", "mask", "color_mask", "reference"):
         path = getattr(args, name)
         if path is not None:
@@ -300,6 +309,7 @@ def main():
         "reference": file_identity(args.reference) if args.reference else None,
         "warmup_runs": args.warmup, "measured_runs": args.runs,
         "lifecycles": args.lifecycles,
+        "parallel_threads_requested": args.threads,
         "rounds": round_count, "requested_rounds": args.rounds,
         "shuffle_enabled": shuffle, "shuffle_seed": seed, "execution_order": schedule,
     }
@@ -318,6 +328,8 @@ def main():
                    "--warmup", str(args.warmup), "--runs", str(job["measured_runs"]), "--metrics", str(metrics_path)]
         if mode == "parallel":
             command.append("--parallel")
+            if args.threads is not None:
+                command.extend(["--threads", str(args.threads)])
         print(f"Round {job['round']}/{round_count}, {job['position']}/{len(configurations)}: "
               f"{algorithm} / {mode} / {lifecycle} ({args.warmup} warm-up + {job['measured_runs']} measured)...", flush=True)
         completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace")

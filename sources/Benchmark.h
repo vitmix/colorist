@@ -20,7 +20,7 @@ struct Measurement
 };
 
 inline void SaveMeasurements(const std::string& filename, const std::string& algorithm,
-                             bool parallel_requested, bool parallel_labeling, int threads,
+                             bool parallel_requested, bool parallel_labeling, bool parallel_coloring, int threads,
                              const cv::Mat& mask, int connectivity, int warmup_runs,
                              const std::vector<Measurement>& measurements, const IAlgo& algo,
                              const std::string& lifecycle)
@@ -50,6 +50,7 @@ inline void SaveMeasurements(const std::string& filename, const std::string& alg
          << "algorithm_effective" << (algorithm == "base_bbdt" && connectivity == 4 ? "base_sauf" : algorithm)
          << "parallel_requested" << int(parallel_requested)
          << "parallel_labeling" << int(parallel_labeling)
+         << "parallel_coloring" << int(parallel_coloring)
          << "opencv_threads" << threads << "parallel_backend" << backend
          << "connectivity" << connectivity << "image_width" << mask.cols << "image_height" << mask.rows
          << "foreground_threshold" << 127

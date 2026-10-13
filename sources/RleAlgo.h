@@ -19,6 +19,13 @@
 
 class RleAlgo : public IAlgo {
 public:
+    bool SupportsParallelColoring() const override { return true; }
+
+    void SetNumThreads(int num_threads) override {
+        CV_Assert(num_threads > 0);
+        m_num_threads = num_threads;
+    }
+
     struct Run {
         int id;
         int x0;
@@ -275,51 +282,61 @@ public:
 
         // Jump over unwritten run interiors using their packed lengths. Every
         // position examined is either a run-start marker or initialized background.
-        for (int y = 0; y < height; ++y) {
-            auto* out_ptr = output.ptr<cv::Vec4b>(y);
-            const int packed_width = y < packed_stop_y ? width :
-                y == packed_stop_y ? packed_stop_x : 0;
-            int c = 0;
 
-            while (c < packed_width) {
-                while (c < packed_width && PackColor(out_ptr[c]) == BackgroundMarker)
-                    ++c;
-                if (c == packed_width)
-                    break;
+        cv::parallel_for_(
+            cv::Range(0, height),
+            [&](const cv::Range& range) {
+                for (int row_id = range.start; row_id < range.end; ++row_id) {
+                    auto* out_ptr = output.ptr<cv::Vec4b>(row_id);
+                    const int packed_width = row_id < packed_stop_y ? width :
+                                    row_id == packed_stop_y ? packed_stop_x : 0;
+                    int c = 0;
 
-                const int run_start = c;
-                const auto metadata = PackColor(out_ptr[run_start]);
-                const int component_id = static_cast<int>(metadata & ComponentIdMask);
-                c += static_cast<int>(metadata >> ComponentIdBits);
-                const cv::Vec4b color = UnpackColor(m_histograms[m_nodes[component_id].hist_id][0]);
-                std::fill(out_ptr + run_start, out_ptr + c, color);
-            }
+                    while (c < packed_width) {
+                        while (c < packed_width && PackColor(out_ptr[c]) == BackgroundMarker)
+                            ++c;
+                        if (c == packed_width)
+                            break;
 
-            // Wide images, excessive component IDs, or a reserved-marker collision
-            // use full-ID markers and mask boundaries, without clearing interiors.
-            if (c < width) {
-                const auto* mask_ptr = mask.ptr<uchar>(y);
-                while (c < width) {
-                    while (c < width && mask_ptr[c] <= 127)
-                        ++c;
-                    if (c == width)
-                        break;
+                        const int run_start = c;
+                        const auto metadata = PackColor(out_ptr[run_start]);
+                        const int component_id = static_cast<int>(metadata & ComponentIdMask);
+                        c += static_cast<int>(metadata >> ComponentIdBits);
+                        const cv::Vec4b color = UnpackColor(m_histograms[m_nodes[component_id].hist_id][0]);
+                        std::fill(out_ptr + run_start, out_ptr + c, color);
+                    }
 
-                    const int run_start = c;
-                    const int component_id = UnpackComponentId(out_ptr[run_start]);
-                    const cv::Vec4b color = UnpackColor(m_histograms[m_nodes[component_id].hist_id][0]);
-                    while (c < width && mask_ptr[c] > 127)
-                        ++c;
-                    std::fill(out_ptr + run_start, out_ptr + c, color);
+                    // Wide images, excessive component IDs, or a reserved-marker collision
+                    // use full-ID markers and mask boundaries, without clearing interiors.
+                    if (c < width) {
+                        const auto* mask_ptr = mask.ptr<uchar>(row_id);
+                        while (c < width) {
+                            while (c < width && mask_ptr[c] <= 127)
+                                ++c;
+                            if (c == width)
+                                break;
+
+                            const int run_start = c;
+                            const int component_id = UnpackComponentId(out_ptr[run_start]);
+                            const cv::Vec4b color = UnpackColor(m_histograms[m_nodes[component_id].hist_id][0]);
+                            while (c < width && mask_ptr[c] > 127)
+                                ++c;
+                            std::fill(out_ptr + run_start, out_ptr + c, color);
+                        }
+                    }
                 }
-            }
-        }
+            },
+            m_num_threads
+        );
+
 #ifdef COLORIST_TIMING
         record_time(4);
 #endif
     }
 
 private:
+    int m_num_threads = 1;
+
     // Resolve recurring colors through the cache before searching the sorted lookup.
     static constexpr bool UseColorCache = true;
     static constexpr std::size_t ColorCacheSize = 64;

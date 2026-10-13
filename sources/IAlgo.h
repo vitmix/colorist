@@ -13,6 +13,8 @@ public:
     // Caller provides a CV_8UC4 output of the input size; every pixel is overwritten.
     virtual void Compute(const cv::Mat& mask, const cv::Mat& color_mask, cv::Mat& output) = 0;
     virtual bool SupportsParallelLabeling() const { return false; }
+    virtual bool SupportsParallelColoring() const { return false; }
+    virtual void SetNumThreads(int) {}
 #ifdef COLORIST_TIMING
     virtual const std::array<double, 5>& GetTimings() const = 0;
     virtual const std::array<const char*, 5>& GetTimingKeys() const = 0;
