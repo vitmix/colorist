@@ -18,17 +18,18 @@ import sys
 
 
 ALGORITHMS = ("base_spaghetti", "base_sauf", "base_bbdt")
+RLE_ALGORITHMS = ("rle",)
 MODES = ("sequential", "parallel")
 LIFECYCLES = ("reuse", "fresh")
 STAGES = ("threshold_ms", "ccl_ms", "histogram_ms", "color_selection_ms", "final_coloring_ms")
 STAGE_LABELS = ("Threshold", "CCL", "Histogram", "Selection", "Coloring")
 RLE_STAGES = ("setup_ms", "scan_ccl_histogram_ms", "root_resolution_ms",
               "color_selection_ms", "final_coloring_ms")
-RLE_STAGE_LABELS = ("Setup", "Scan/CCL/hist", "Reconciliation", "Selection", "Coloring")
+RLE_STAGE_LABELS = ("Setup", "Scan/CCL/hist/paint", "Reconciliation", "Selection", "Coloring")
 
 
 def timing_stages(metadata):
-    return RLE_STAGES if metadata.get("algorithm_requested") == "rle" else STAGES
+    return RLE_STAGES if metadata.get("algorithm_requested") in RLE_ALGORITHMS else STAGES
 
 
 def summarize(values):
@@ -248,7 +249,7 @@ def parse_args():
     parser.add_argument("--exe", type=Path, default=Path("build/colorist.exe" if os.name == "nt" else "build/colorist"))
     parser.add_argument("--mask", type=Path, required=True)
     parser.add_argument("--color-mask", type=Path, required=True)
-    parser.add_argument("--algos", nargs="+", choices=ALGORITHMS + ("rle",), default=list(ALGORITHMS))
+    parser.add_argument("--algos", nargs="+", choices=ALGORITHMS + RLE_ALGORITHMS, default=list(ALGORITHMS))
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--threads", type=int, help="OpenCV thread count for parallel experiments (default: automatic)")
     parser.add_argument("--lifecycles", nargs="+", choices=LIFECYCLES, default=list(LIFECYCLES),

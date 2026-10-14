@@ -224,7 +224,10 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "Lifecycle: " << lifecycle
                   << (fresh ? " (Compute + instance destruction timed)\n" : " (Compute including reset timed)\n");
-        // Allocate once outside all timers. Each algorithm paints every pixel on every call.
+        if (stripe_labeling)
+            std::cout << "RLE completion: definite interior painting + histogram recycling included in scan time; "
+                         "boundary components wait for reconciliation\n";
+        // Allocate once outside all timers. Each algorithm defines every pixel on every call.
         cv::Mat result(mask.size(), algo->GetOutputType());
         for (int run = 0; run < warmup_runs; ++run) {
             auto warmup_algo = fresh ? CreateAlgo(algo_type, thread_count) : nullptr;

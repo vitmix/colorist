@@ -53,14 +53,18 @@ Image I/O is excluded. Results and JSON/CSV reports go into `build/bench/`.
 Change `--threads` to compare thread counts; add `--lifecycles reuse` to measure
 only buffer reuse. Keep cooling and background workload consistent between runs.
 
-The current RLE experiment keeps BGRA input/histograms and writes BGR output
-(alpha is omitted). Foreground runs of two or more pixels store tagged length
-and a 24-bit component ID in their first two pixels. Foreground singletons use
-one pixel with a 22-bit ID; background stores a tagged length in one pixel.
-Lengths fit 22 bits. Larger widths or singleton IDs use checked 24-bit ID headers
-and mask scans. Headers never extend outside their run.
-Copy `sources/RleAlgo.h`, `sources/IAlgo.h` and `sources/main.cpp` together when
-updating the Pi manually, then rebuild with the command above.
+`rle` uses definite component completion. Finished interior components are
+painted once during scanning, and their histogram slots are recycled. Components
+touching internal stripe edges wait for reconciliation. Input remains BGRA and
+output is BGR. Linked run metadata stays outside output pixels.
+
+`Scan/CCL/hist/paint` includes early selection/painting and completion bookkeeping;
+final coloring only paints deferred boundary components. Judge total time.
+Copy updated `sources/RleAlgo.h`, `sources/main.cpp` and `bench.py` and rebuild.
+
+```sh
+.venv/bin/python bench.py --mask test_task_CV_CPP/mask.png --color-mask test_task_CV_CPP/color_mask.png --algos rle --threads 2 --warmup 3 --runs 30 --reference build/reference.png --output-dir build/bench-rle
+```
 
 ## Profile with perf
 
