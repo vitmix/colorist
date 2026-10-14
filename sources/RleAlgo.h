@@ -35,6 +35,11 @@ public:
         m_num_threads = num_threads;
     }
 
+    void SetColorBatch(int segments) {
+        CV_Assert(segments >= 0);
+        m_color_batch = segments;
+    }
+
 #ifdef COLORIST_TIMING
     const std::array<double, 5>& GetTimings() const override { return m_timings_ms; }
 
@@ -91,6 +96,7 @@ public:
 
         const int height = mask.rows;
         const int width = mask.cols;
+        const int color_segments = std::min(width, m_color_batch);
 
         const int stripe_count = std::min(height, m_num_threads);
         m_stripes.resize(stripe_count);
@@ -138,6 +144,16 @@ public:
                         auto* out_ptr = output.ptr<cv::Vec3b>(y);
 
                         int c = 0;
+                        int next_flush_x = color_segments > 0 ?
+                            static_cast<int>((std::int64_t(width) + color_segments - 1) / color_segments) : width;
+                        std::size_t completion_cursor = 0;
+                        if (color_segments > 0) {
+                            // Last occurrence of each root in this previous-row frontier.
+                            // A left branch cannot finish while another branch remains to the right.
+                            for (std::size_t j = 0; j < prev_run_row.size(); ++j)
+                                stripe.last_previous_runs[uni.Root(prev_run_row[j].id)] =
+                                    static_cast<std::uint32_t>(j);
+                        }
 
                         cursor = 0;
 
@@ -194,6 +210,8 @@ public:
                                     uni.nodes.push_back({static_cast<std::uint32_t>(component_root),
                                                          {1}, hists.AcquireSlot()});
                                     stripe.completion.emplace_back();
+                                    if (color_segments > 0)
+                                        stripe.last_previous_runs.push_back(InvalidRun);
                                 }
 
                                 curr_run_row.back().id = component_root;
@@ -255,15 +273,31 @@ public:
 
                                 std::fill(out_ptr + run_start, out_ptr + c, black);
                             }
+                            // Never split a run to flush. Coalesce checkpoints crossed
+                            // by one long span; the final checkpoint follows row completion.
+                            if (color_segments > 1 && c < width && c >= next_flush_x) {
+                                FinalizeBeforeColumn(stripe, prev_run_row, completion_cursor, y, c, output);
+                                FlushPaintBatch(stripe, output);
+                                const auto next_segment = std::int64_t(c) * color_segments / width + 1;
+                                next_flush_x = static_cast<int>((std::int64_t(width) * next_segment +
+                                                                color_segments - 1) / color_segments);
+                            }
                         }
-                        // Resolve row IDs after all unions. A released histogram marks
-                        // roots already painted, even if several previous runs reference them.
-                        for (const auto& run : prev_run_row) {
-                            const int root = uni.Root(run.id);
-                            const auto& state = stripe.completion[root];
-                            if (state.last_seen != y && !state.boundary && uni.GetHistId(root) >= 0)
-                                FinalizeComponent(stripe, root, output);
+                        if (color_segments > 0) {
+                            FinalizeBeforeColumn(stripe, prev_run_row, completion_cursor, y, width, output);
+                        } else {
+                            // Resolve row IDs after all unions. A released histogram marks
+                            // roots already painted, even if several runs reference them.
+                            for (const auto& run : prev_run_row) {
+                                const int root = uni.Root(run.id);
+                                const auto& state = stripe.completion[root];
+                                if (state.last_seen != y && !state.boundary && uni.GetHistId(root) >= 0)
+                                    FinalizeComponent(stripe, root, output);
+                            }
                         }
+                        // Batched modes flush at each row end; zero paints directly.
+                        if (color_segments > 0)
+                            FlushPaintBatch(stripe, output);
                         std::swap(prev_run_row, curr_run_row);
                         if (y == stripe_begin)
                             stripe.first_row = prev_run_row;
@@ -276,6 +310,8 @@ public:
                         if (!stripe.completion[root].boundary && uni.GetHistId(root) >= 0)
                             FinalizeComponent(stripe, root, output);
                     }
+                    if (color_segments > 0)
+                        FlushPaintBatch(stripe, output);
 
                     // Local root resolving
                     for (std::size_t comp_id = 0; comp_id < uni.nodes.size(); ++comp_id) {
@@ -350,9 +386,15 @@ public:
                 for (int i = range.start; i < range.end; ++i) {
                     auto& stripe = m_stripes[i];
                     for (std::size_t id = 0; id < stripe.completion.size(); ++id)
-                        if (stripe.completion[id].head != InvalidRun)
-                            PaintComponentRuns(stripe, static_cast<int>(id), output,
-                                               stripe.uni.nodes[id].final_color);
+                        if (stripe.completion[id].head != InvalidRun) {
+                            const auto color = stripe.uni.nodes[id].final_color;
+                            if (color_segments == 0)
+                                PaintComponentRuns(stripe, static_cast<int>(id), output, color);
+                            else
+                                QueueComponentRuns(stripe, static_cast<int>(id), color);
+                        }
+                    if (color_segments > 0)
+                        FlushPaintBatch(stripe, output);
                 }
             }, m_num_threads
         );
@@ -366,17 +408,31 @@ private:
     static void FillBgrRun(cv::Vec3b* destination, int length, std::uint32_t packed_color) {
         const int lanes = cv::VTraits<cv::v_uint8>::vlanes();
         const cv::Vec3b color = UnpackColor(packed_color);
-        if (length >= lanes) {
-            const auto blue = cv::vx_setall_u8(color[0]);
-            const auto green = cv::vx_setall_u8(color[1]);
-            const auto red = cv::vx_setall_u8(color[2]);
-            do {
-                cv::v_store_interleave(reinterpret_cast<uchar*>(destination), blue, green, red);
-                destination += lanes;
-                length -= lanes;
-            } while (length >= lanes);
+        if (length < lanes) {
+            std::fill(destination, destination + length, color);
+            return;
         }
-        std::fill(destination, destination + length, color);
+
+        // Interleave once. Plain stores avoid constructing/reloading a NEON
+        // three-vector tuple on every iteration of the fill loop.
+        std::array<uchar, 3 * CV_SIMD_WIDTH> pattern;
+        cv::v_store_interleave(pattern.data(), cv::vx_setall_u8(color[0]),
+                               cv::vx_setall_u8(color[1]), cv::vx_setall_u8(color[2]));
+        const auto first = cv::vx_load(pattern.data());
+        const auto second = cv::vx_load(pattern.data() + lanes);
+        const auto third = cv::vx_load(pattern.data() + 2 * lanes);
+        auto* cursor = reinterpret_cast<uchar*>(destination);
+        auto* last = reinterpret_cast<uchar*>(destination + length - lanes);
+        const auto store = [&](uchar* target) {
+            cv::vx_store(target, first);
+            cv::vx_store(target + lanes, second);
+            cv::vx_store(target + 2 * lanes, third);
+        };
+        for (; cursor < last; cursor += 3 * lanes)
+            store(cursor);
+        // The final full block ends at the run boundary. Any overlap writes
+        // the same color inside this run, eliminating the scalar remainder.
+        store(last);
     }
 
 #ifdef COLORIST_TIMING
@@ -389,6 +445,8 @@ private:
 
         for (auto& stripe : m_stripes) {
             stripe.paint_runs.clear();
+            stripe.pending_paint.clear();
+            stripe.last_previous_runs.clear();
             stripe.completion.clear();
             stripe.uni.nodes.clear();
             stripe.uni.nodes.reserve(expected_runs);
@@ -416,6 +474,7 @@ private:
     }
 
     int m_num_threads = 1;
+    int m_color_batch = 0; // Zero: immediate component painting; positive: checkpoints per row.
     static constexpr std::uint32_t CrossStripeParent = 0x80000000u;
     // Component references always carry the tag, so zero is an invalid reference.
     static constexpr std::uint32_t InvalidComponent = 0;
@@ -444,11 +503,18 @@ private:
     };
     static_assert(sizeof(PaintRun) == 4 * sizeof(std::uint32_t), "Linked paint runs must stay compact");
 
+    struct PendingPaint {
+        std::uint32_t run;
+        std::uint32_t color;
+    };
+
     struct Completion {
         std::uint32_t head{InvalidRun}, tail{InvalidRun};
         int last_seen{-1};
         bool boundary{false};
     };
+    static_assert(sizeof(Completion) == 4 * sizeof(std::uint32_t),
+                  "Batch checkpoints must not enlarge baseline completion records");
 
     struct UnionNode {
         std::uint32_t parent;
@@ -631,6 +697,9 @@ private:
         std::vector<std::uint32_t> palette;
         std::vector<Run> first_row, last_row, temp_row;
         std::vector<PaintRun> paint_runs;
+        std::vector<PendingPaint> pending_paint;
+        // Only batched modes need a per-root previous-row frontier index.
+        std::vector<std::uint32_t> last_previous_runs;
         // Node IDs stay stable; only histogram slots are recycled.
         std::vector<Completion> completion;
     };
@@ -657,8 +726,18 @@ private:
             a.tail = b.tail;
         }
         a.last_seen = std::max(a.last_seen, b.last_seen);
+        if (!stripe.last_previous_runs.empty())
+            stripe.last_previous_runs[winner] = std::max(stripe.last_previous_runs[winner],
+                                                       stripe.last_previous_runs[loser]);
         a.boundary = a.boundary || b.boundary;
         b.head = b.tail = InvalidRun;
+    }
+
+    static void QueueComponentRuns(Stripe& stripe, int root, std::uint32_t color) {
+        auto& state = stripe.completion[root];
+        for (auto index = state.head; index != InvalidRun; index = stripe.paint_runs[index].next)
+            stripe.pending_paint.push_back({index, color});
+        state.head = state.tail = InvalidRun;
     }
 
     static void PaintComponentRuns(Stripe& stripe, int root, cv::Mat& output, std::uint32_t color) {
@@ -668,6 +747,34 @@ private:
             FillBgrRun(output.ptr<cv::Vec3b>(run.y) + run.x0, run.length, color);
         }
         state.head = state.tail = InvalidRun;
+    }
+
+    void FinalizeBeforeColumn(Stripe& stripe, const Runs& previous, std::size_t& cursor,
+                              int row, int column, cv::Mat& output) {
+        // Only previous spans strictly before the processed prefix are exhausted.
+        while (cursor < previous.size() && previous[cursor].x1 < column) {
+            const int root = stripe.uni.Root(previous[cursor].id);
+            const auto& state = stripe.completion[root];
+            if (stripe.last_previous_runs[root] == cursor && state.last_seen != row &&
+                !state.boundary && stripe.uni.GetHistId(root) >= 0)
+                FinalizeComponent(stripe, root, output);
+            ++cursor;
+        }
+    }
+
+    static void FlushPaintBatch(Stripe& stripe, cv::Mat& output) {
+        auto& pending = stripe.pending_paint;
+        if (pending.empty())
+            return;
+        // Runs are appended left-to-right, top-to-bottom, so index order is row order.
+        std::sort(pending.begin(), pending.end(), [](const PendingPaint& a, const PendingPaint& b) {
+            return a.run < b.run;
+        });
+        for (const auto& paint : pending) {
+            const auto& run = stripe.paint_runs[paint.run];
+            FillBgrRun(output.ptr<cv::Vec3b>(run.y) + run.x0, run.length, paint.color);
+        }
+        pending.clear(); // Retain storage across batches and Compute calls.
     }
 
     static std::uint32_t SelectColor(const Stripe& stripe, int hist_id) {
@@ -680,10 +787,14 @@ private:
         return stripe.palette[best];
     }
 
-    static void FinalizeComponent(Stripe& stripe, int root, cv::Mat& output) {
+    void FinalizeComponent(Stripe& stripe, int root, cv::Mat& output) {
         auto& node = stripe.uni.nodes[root];
         node.final_color = SelectColor(stripe, node.hist_id);
-        PaintComponentRuns(stripe, root, output, node.final_color);
+        if (m_color_batch == 0)
+            PaintComponentRuns(stripe, root, output, node.final_color);
+        else
+            // Store the definite color before releasing its histogram.
+            QueueComponentRuns(stripe, root, node.final_color);
         stripe.hists.free_slots.push_back(node.hist_id);
         node.hist_id = -1;
     }

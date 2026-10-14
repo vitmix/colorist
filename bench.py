@@ -18,7 +18,7 @@ import sys
 
 
 ALGORITHMS = ("base_spaghetti", "base_sauf", "base_bbdt")
-RLE_ALGORITHMS = ("rle",)
+RLE_ALGORITHMS = ("rle", "rle_stream", "rle_stream_nozva")
 MODES = ("sequential", "parallel")
 LIFECYCLES = ("reuse", "fresh")
 STAGES = ("threshold_ms", "ccl_ms", "histogram_ms", "color_selection_ms", "final_coloring_ms")
@@ -71,7 +71,7 @@ def compare_images(actual, reference):
             "differing_pixels": count, "difference_percent": 100.0 * count / pixels}
 
 
-def validate_measurements(data, algorithm, mode, runs, warmup, lifecycle="reuse"):
+def validate_measurements(data, algorithm, mode, runs, warmup, lifecycle="reuse", color_batch=0):
     if data.get("schema_version") != 1:
         raise ValueError("Unsupported measurements schema; rebuild colorist")
     metadata = data["metadata"]
@@ -83,6 +83,8 @@ def validate_measurements(data, algorithm, mode, runs, warmup, lifecycle="reuse"
         raise ValueError("Measurements do not match the requested experiment")
     if metadata.get("lifecycle", "reuse") != lifecycle:
         raise ValueError("Measurements do not match the requested lifecycle")
+    if metadata.get("color_batch", 0) != (color_batch if algorithm == "rle" else 0):
+        raise ValueError("Measurements do not match --color-batch; rebuild colorist")
     expected = "base_sauf" if algorithm == "base_bbdt" and metadata["connectivity"] == 4 else algorithm
     if metadata["algorithm_effective"] != expected:
         raise ValueError("Unexpected effective labeling algorithm")
@@ -220,6 +222,7 @@ def save_reports(directory, context, experiments):
                     "labeling": "parallel" if metadata["parallel_labeling"] else "sequential",
                     "coloring": "parallel" if metadata.get("parallel_coloring") else "sequential",
                     "threads": metadata["opencv_threads"], "rounds": len(experiment["rounds"])}
+        identity["color_batch"] = metadata.get("color_batch", 0)
         comparison = experiment["comparison"]
         summaries.append({**identity, "runs": len(experiment["samples"]),
                           **experiment["statistics"],
@@ -252,6 +255,8 @@ def parse_args():
     parser.add_argument("--algos", nargs="+", choices=ALGORITHMS + RLE_ALGORITHMS, default=list(ALGORITHMS))
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--threads", type=int, help="OpenCV thread count for parallel experiments (default: automatic)")
+    parser.add_argument("--color-batch", "--color_batch", type=int,
+                        help="RLE row checkpoints: 0 = immediate completion painting, 1 = row ends, 2 = midpoint/end (default: 0)")
     parser.add_argument("--lifecycles", nargs="+", choices=LIFECYCLES, default=list(LIFECYCLES),
                         help="Instance reuse/fresh modes (default: both)")
     parser.add_argument("--warmup", type=int, default=3, help="Warm-up runs per configuration per round (default: 3)")
@@ -268,6 +273,13 @@ def parse_args():
         parser.error("--threads must be an integer between 1 and 2147483647")
     if args.threads is not None and "parallel" not in args.modes:
         parser.error("--threads requires a parallel mode")
+    if args.color_batch is not None:
+        if not 0 <= args.color_batch <= 2147483647:
+            parser.error("--color-batch must be an integer between 0 and 2147483647")
+        if "rle" not in args.algos:
+            parser.error("--color-batch requires rle in --algos")
+    else:
+        args.color_batch = 0
     for name in ("exe", "mask", "color_mask", "reference"):
         path = getattr(args, name)
         if path is not None:
@@ -309,6 +321,7 @@ def main():
         "warmup_runs": args.warmup, "measured_runs": args.runs,
         "lifecycles": args.lifecycles,
         "parallel_threads_requested": args.threads,
+        "rle_color_batch": args.color_batch,
         "rounds": round_count, "requested_rounds": args.rounds,
         "shuffle_enabled": shuffle, "shuffle_seed": seed, "execution_order": schedule,
     }
@@ -325,6 +338,8 @@ def main():
         command = [str(args.exe), "--mask", str(args.mask), "--color_mask", str(args.color_mask),
                    "--output", str(result_path), "--algo-type", algorithm, "--lifecycle", lifecycle,
                    "--warmup", str(args.warmup), "--runs", str(job["measured_runs"]), "--metrics", str(metrics_path)]
+        if algorithm == "rle":
+            command.extend(["--color-batch", str(args.color_batch)])
         if mode == "parallel":
             command.append("--parallel")
             if args.threads is not None:
@@ -336,7 +351,8 @@ def main():
             raise RuntimeError(f"{name} exited with {completed.returncode}:\n{completed.stderr or completed.stdout}")
         with metrics_path.open(encoding="utf-8") as stream:
             data = json.load(stream)
-        metadata, samples = validate_measurements(data, algorithm, mode, job["measured_runs"], args.warmup, lifecycle)
+        metadata, samples = validate_measurements(data, algorithm, mode, job["measured_runs"], args.warmup,
+                                                 lifecycle, args.color_batch)
         comparison = compare_images(load_rgba(result_path), reference) if reference is not None else None
         experiment = merge_batch(collected.get(configuration), metadata, samples, job, comparison, result_path)
         collected[configuration] = experiment

@@ -53,17 +53,29 @@ Image I/O is excluded. Results and JSON/CSV reports go into `build/bench/`.
 Change `--threads` to compare thread counts; add `--lifecycles reuse` to measure
 only buffer reuse. Keep cooling and background workload consistent between runs.
 
-`rle` uses definite component completion. Finished interior components are
-painted once during scanning, and their histogram slots are recycled. Components
-touching internal stripe edges wait for reconciliation. Input remains BGRA and
+`rle` uses definite component completion. By default (`--color-batch 0`), each
+finished interior component is painted immediately and its histogram released.
+This is the original completion mode, with no pending-run queue or sorting.
+Add `--color-batch N` to opt into batching: `1` means each row end, `2` means
+midpoint/end. Positive modes queue runs with their definite colors. Checkpoints
+wait for the current run to finish; a long run may cross multiple checkpoints.
+With this option, a component can finish mid-row only after its last previous-row
+span has been passed without any current-row connection. Stripe-boundary
+components still wait for reconciliation. Values above image width are capped
+at one checkpoint per column. Both app and `bench.py` accept this option.
+Components touching internal stripe edges wait for reconciliation. Input remains BGRA and
 output is BGR. Linked run metadata stays outside output pixels.
 
 `Scan/CCL/hist/paint` includes early selection/painting and completion bookkeeping;
-final coloring only paints deferred boundary components. Judge total time.
-Copy updated `sources/RleAlgo.h`, `sources/main.cpp` and `bench.py` and rebuild.
+final coloring paints deferred boundary components. Positive batch modes sort
+their runs into row order; the default paints component lists directly. All
+sorting and painting are timed. Judge total time; batching is an experiment,
+and does not guarantee a speedup or cache residency.
+Copy updated `sources/RleAlgo.h`, `sources/main.cpp`, `sources/Benchmark.h` and
+`bench.py` and rebuild.
 
 ```sh
-.venv/bin/python bench.py --mask test_task_CV_CPP/mask.png --color-mask test_task_CV_CPP/color_mask.png --algos rle --threads 2 --warmup 3 --runs 30 --reference build/reference.png --output-dir build/bench-rle
+.venv/bin/python bench.py --mask test_task_CV_CPP/mask.png --color-mask test_task_CV_CPP/color_mask.png --algos rle --threads 2 --color-batch 2 --warmup 3 --runs 30 --reference build/reference.png --output-dir build/bench-rle-batch2
 ```
 
 ## Profile with perf
