@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 #include <utility>
@@ -25,6 +26,7 @@ class RleAlgo : public IAlgo {
 public:
     explicit RleAlgo(int num_threads = 1) { SetNumThreads(num_threads); }
 
+    int GetOutputType() const override { return CV_8UC3; }
     bool SupportsParallelLabeling() const override { return true; }
     bool SupportsParallelColoring() const override { return true; }
 
@@ -67,7 +69,7 @@ public:
         CV_Assert(color_mask.type() == CV_8UC4);
         CV_Assert(mask.size() == color_mask.size());
         CV_Assert(!mask.empty());
-        CV_Assert(output.type() == CV_8UC4);
+        CV_Assert(output.type() == GetOutputType());
         CV_Assert(output.size() == mask.size());
         // Every bin and every merged component count is bounded by image area.
         if (static_cast<std::uint64_t>(mask.rows) * static_cast<std::uint64_t>(mask.cols) >
@@ -85,7 +87,7 @@ public:
         };
 #endif
 
-        const cv::Vec4b black(0, 0, 0, 255);
+        const cv::Vec3b black(0, 0, 0);
 
         const int height = mask.rows;
         const int width = mask.cols;
@@ -93,7 +95,9 @@ public:
         const int stripe_count = std::min(height, m_num_threads);
         m_stripes.resize(stripe_count);
         ConfigureParentEncoding(stripe_count);
-        const std::uint64_t node_capacity = std::uint64_t{1} << m_parent_node_bits;
+        // Full-ID fallback headers occupy one three-byte output pixel.
+        const std::uint64_t node_capacity = std::min(std::uint64_t{1} << m_parent_node_bits,
+                                                     std::uint64_t{1} << 24);
 
         ResetWorkingBuffers(height);
 
@@ -101,12 +105,12 @@ public:
         record_time(0);
 #endif
 
-        const int mask_block_sz = cv::VTraits<cv::v_uint8>::vlanes();
-        const int color_block_sz = cv::VTraits<cv::v_uint32>::vlanes();
-        const cv::v_uint8 cmp_block = cv::vx_setall_u8(127);
-
         cv::parallel_for_(cv::Range(0, stripe_count),
             [&](const cv::Range& range) {
+                const int mask_block_sz = cv::VTraits<cv::v_uint8>::vlanes();
+                const int color_block_sz = cv::VTraits<cv::v_uint32>::vlanes();
+                const cv::v_uint8 cmp_block = cv::vx_setall_u8(127);
+
                 for (int i = range.start; i < range.end; ++i) {
                     const int stripe_begin = static_cast<int>(
                         std::int64_t(height) * i / stripe_count);
@@ -128,8 +132,9 @@ public:
                     curr_run_row.clear();
                     stripe.first_row.clear();
 
-                    // Before the fallback boundary, markers contain both the component ID and
-                    // run length. After it, they contain full IDs and coloring reads the mask.
+                    // Foreground singletons store their ID in one pixel. Longer runs
+                    // store tagged length + ID in two pixels. Background needs one header.
+                    // After the fallback boundary, foreground headers contain full IDs.
                     bool packed_runs = width <= static_cast<int>(MaxRunLength);
                     stripe.packed_stop_x = 0;
                     stripe.packed_stop_y = packed_runs ? height : 0;
@@ -142,7 +147,7 @@ public:
                     for (int y = stripe_begin; y < stripe_end; ++y) {
                         const auto* mask_ptr = mask.ptr<uchar>(y);
                         const auto* cmask_ptr = color_mask.ptr<cv::Vec4b>(y);
-                        auto* out_ptr = output.ptr<cv::Vec4b>(y);
+                        auto* out_ptr = output.ptr<cv::Vec3b>(y);
 
                         int c = 0;
 
@@ -194,11 +199,11 @@ public:
                                 if (component_root == -1) {
                                     if (Unlikely(uni.nodes.size() >= node_capacity))
                                         CV_Error_(cv::Error::StsOutOfRange,
-                                            ("Stripe %d exceeds the tagged-parent capacity of %llu nodes (%u node bits)",
+                                            ("Stripe %d exceeds the BGR-header/parent capacity of %llu nodes (%u parent bits; 24 header bits)",
                                              i, static_cast<unsigned long long>(node_capacity), m_parent_node_bits));
                                     component_root = uni.GetId();
                                     uni.nodes.push_back({static_cast<std::uint32_t>(component_root),
-                                                         1, hists.AcquireSlot()});
+                                                         {1}, hists.AcquireSlot()});
                                 }
 
                                 curr_run_row.back().id = component_root;
@@ -208,7 +213,7 @@ public:
                                 const auto hist_id = uni.GetHistId(component_root);
                                 int x = run_start;
                                 while (x < c) {
-                                    const auto color = PackColor(cmask_ptr[x]);
+                                    const auto color = LoadPacked(cmask_ptr[x]);
                                     const auto repeated_color = cv::vx_setall_u32(color);
                                     const int stretch_start = x++;
 
@@ -225,7 +230,7 @@ public:
                                         x += color_block_sz;
                                     }
 
-                                    while (x < c && PackColor(cmask_ptr[x]) == color)
+                                    while (x < c && LoadPacked(cmask_ptr[x]) == color)
                                         ++x;
 
                                     if (!cache_valid || color != prev_color) {
@@ -238,22 +243,35 @@ public:
                                 }
 
                                 if (packed_runs) {
-                                    const auto metadata = PackRunMetadata(component_root, c - run_start);
-                                    if (static_cast<std::uint32_t>(component_root) > ComponentIdMask ||
-                                        metadata == BackgroundMarker) {
+                                    if (!StoreForegroundHeader(out_ptr + run_start,
+                                                               component_root, c - run_start)) {
                                         packed_runs = false;
                                         stripe.packed_stop_y = y;
                                         stripe.packed_stop_x = run_start;
-                                    } else {
-                                        out_ptr[run_start] = UnpackColor(metadata);
                                     }
                                 }
                                 if (!packed_runs) {
                                     out_ptr[run_start] = PackComponentId(component_root);
                                 }
                             } else {
-                                out_ptr[c] = black;
-                                ++c;
+                                const int run_start = c;
+                                while (width - c >= mask_block_sz) {
+                                    const auto batch = cv::vx_load(mask_ptr + c);
+                                    const auto foreground = cv::v_gt(batch, cmp_block);
+                                    if (cv::v_check_any(foreground)) {
+                                        c += cv::v_scan_forward(foreground);
+                                        break;
+                                    }
+                                    c += mask_block_sz;
+                                }
+                                while (c < width && mask_ptr[c] <= 127)
+                                    ++c;
+
+                                if (packed_runs)
+                                    out_ptr[run_start] = UnpackColor(BackgroundRun |
+                                        static_cast<std::uint32_t>(c - run_start));
+                                else
+                                    std::fill(out_ptr + run_start, out_ptr + c, black);
                             }
                         }
                         std::swap(prev_run_row, curr_run_row);
@@ -305,69 +323,83 @@ public:
         record_time(2);
 #endif
 
+        // Unions are finished: reuse each root's size storage for its final color.
         // Select a winner once per root, including valid packed color zero.
         for (auto& stripe : m_stripes) {
             for (std::size_t id = 0; id < stripe.uni.nodes.size(); ++id) {
-                const auto& node = stripe.uni.nodes[id];
+                auto& node = stripe.uni.nodes[id];
                 if (node.parent != id)
                     continue;
 
-                auto& hist = stripe.hists.Get(node.hist_id);
+                const auto& hist = stripe.hists.Get(node.hist_id);
                 std::size_t best = 0;
                 for (std::size_t h = 1; h < hist.size(); ++h) {
                     if (hist[h] > hist[best] ||
                         (hist[h] == hist[best] && stripe.palette[h] < stripe.palette[best]))
                         best = h;
                 }
-                hist[0] = stripe.palette[best];
+                node.final_color = stripe.palette[best];
             }
         }
 
-        // Original local slots remain allocated after boundary unions. Cache their
-        // global winner here; live root colors were all selected before any copying.
-        // No histogram slot is acquired again until the next Compute/reset.
+        // Every parent now points directly to a global root. All root colors were
+        // selected above; cache them in the remaining nodes for direct coloring.
         for (int i = 0; i < stripe_count; ++i) {
             auto& stripe = m_stripes[i];
             for (std::size_t id = 0; id < stripe.uni.nodes.size(); ++id) {
                 const auto root = ParentComponent(PackComponent(i, static_cast<std::uint32_t>(id)));
-                const auto& owner = m_stripes[GetStripeId(root)];
-                const auto& root_node = GetNode(root);
-                if (GetStripeId(root) != i || root_node.hist_id != stripe.uni.nodes[id].hist_id)
-                    stripe.hists.Get(stripe.uni.nodes[id].hist_id)[0] = owner.hists.data[root_node.hist_id][0];
+                stripe.uni.nodes[id].final_color = GetNode(root).final_color;
             }
         }
 #ifdef COLORIST_TIMING
         record_time(3);
 #endif
 
-        // Jump over unwritten run interiors using their packed lengths. Every
-        // position examined is either a run-start marker or initialized background.
+        // Read only initialized headers, then overwrite each complete run.
+        // Packed coloring needs neither the mask nor initialized run interiors.
 
         cv::parallel_for_(cv::Range(0, stripe_count),
             [&](const cv::Range& range) {
+                const int paint_block_sz = cv::VTraits<cv::v_uint8>::vlanes();
                 for (int i = range.start; i < range.end; ++i) {
                     const auto& stripe = m_stripes[i];
                     for (int row_id = stripe.first_row_id; row_id <= stripe.last_row_id; ++row_id) {
-                        auto* out_ptr = output.ptr<cv::Vec4b>(row_id);
+                        auto* out_ptr = output.ptr<cv::Vec3b>(row_id);
+
                         const int packed_width = row_id < stripe.packed_stop_y ? width :
                                         row_id == stripe.packed_stop_y ? stripe.packed_stop_x : 0;
                         int c = 0;
 
                         while (c < packed_width) {
-                            while (c < packed_width && PackColor(out_ptr[c]) == BackgroundMarker)
-                                ++c;
-                            if (c == packed_width)
-                                break;
+                            int run_start = c;
+                            const auto header = LoadPacked(out_ptr[run_start]);
+                            const auto payload = header & RunValueMask;
+                            int length = 1;
+                            std::uint32_t packed_color = 0;
+                            if (header & BackgroundRun) {
+                                length = static_cast<int>(payload);
+                            } else {
+                                auto component_id = payload;
+                                if (header & ExtendedForegroundRun) {
+                                    length = static_cast<int>(payload);
+                                    component_id = LoadPacked(out_ptr[run_start + 1]);
+                                }
+                                packed_color = stripe.uni.nodes[component_id].final_color;
+                            }
 
-                            const int run_start = c;
-                            const auto metadata = PackColor(out_ptr[run_start]);
-                            const int component_id = static_cast<int>(metadata & ComponentIdMask);
-                            c += static_cast<int>(metadata >> ComponentIdBits);
-                            const cv::Vec4b color = UnpackColor(stripe.hists.data[stripe.uni.nodes[component_id].hist_id][0]);
-                            std::fill(out_ptr + run_start, out_ptr + c, color);
+                            const auto blue = cv::vx_setall_u8(static_cast<uchar>(packed_color));
+                            const auto green = cv::vx_setall_u8(static_cast<uchar>(packed_color >> 8));
+                            const auto red = cv::vx_setall_u8(static_cast<uchar>(packed_color >> 16));
+                            c += length;
+                            for (; c - run_start >= paint_block_sz; run_start += paint_block_sz) {
+                                cv::v_store_interleave(reinterpret_cast<uchar*>(out_ptr + run_start),
+                                                       blue, green, red);
+                            }
+
+                            std::fill(out_ptr + run_start, out_ptr + c, UnpackColor(packed_color));
                         }
 
-                        // Wide images, excessive component IDs, or a reserved-marker collision
+                        // Wide images or excessive component IDs
                         // use full-ID markers and mask boundaries, without clearing interiors.
                         if (c < width) {
                             const auto* mask_ptr = mask.ptr<uchar>(row_id);
@@ -379,7 +411,7 @@ public:
 
                                 const int run_start = c;
                                 const int component_id = UnpackComponentId(out_ptr[run_start]);
-                                const cv::Vec4b color = UnpackColor(stripe.hists.data[stripe.uni.nodes[component_id].hist_id][0]);
+                                const cv::Vec3b color = UnpackColor(stripe.uni.nodes[component_id].final_color);
                                 while (c < width && mask_ptr[c] > 127)
                                     ++c;
                                 std::fill(out_ptr + run_start, out_ptr + c, color);
@@ -397,9 +429,18 @@ public:
 
 private:
 
-    static std::uint32_t PackRunMetadata(int component_id, int length) {
-        return static_cast<std::uint32_t>(component_id) |
-            (static_cast<std::uint32_t>(length) << ComponentIdBits);
+    static bool StoreForegroundHeader(cv::Vec3b* destination, int component_id, int length) {
+        const auto id = static_cast<std::uint32_t>(component_id);
+        if (length == 1) {
+            if (Unlikely(id > RunValueMask))
+                return false;
+            destination[0] = UnpackColor(id);
+        } else {
+            // The second header pixel belongs to this run, never the next one.
+            destination[0] = UnpackColor(ExtendedForegroundRun | static_cast<std::uint32_t>(length));
+            destination[1] = PackComponentId(component_id);
+        }
+        return true;
     }
 
 #ifdef COLORIST_TIMING
@@ -423,26 +464,31 @@ private:
         }
     }
 
-    static std::uint32_t PackColor(const cv::Vec4b& color)
+    static inline std::uint32_t LoadPacked(const cv::Vec4b& pixel)
     {
-        return std::uint32_t(color[0]) | (std::uint32_t(color[1]) << 8) |
-            (std::uint32_t(color[2]) << 16) | (std::uint32_t(color[3]) << 24);
+        std::uint32_t value;
+        std::memcpy(&value, &pixel, sizeof(value));
+        return value;
     }
 
-    static cv::Vec4b UnpackColor(std::uint32_t color)
+    static inline std::uint32_t LoadPacked(const cv::Vec3b& pixel)
     {
-        return cv::Vec4b(static_cast<uchar>(color), static_cast<uchar>(color >> 8),
-                        static_cast<uchar>(color >> 16), static_cast<uchar>(color >> 24));
+        return std::uint32_t(pixel[0]) | (std::uint32_t(pixel[1]) << 8) |
+            (std::uint32_t(pixel[2]) << 16);
     }
 
-    static cv::Vec4b PackComponentId(int component_id) {
-        return cv::Vec4b(static_cast<uchar>(component_id), static_cast<uchar>(component_id >> 8),
-                         static_cast<uchar>(component_id >> 16), static_cast<uchar>(component_id>> 24));
+    static cv::Vec3b UnpackColor(std::uint32_t color)
+    {
+        return cv::Vec3b(static_cast<uchar>(color), static_cast<uchar>(color >> 8),
+                        static_cast<uchar>(color >> 16));
     }
 
-    static int UnpackComponentId(const cv::Vec4b& packed_root) {
-        return int(packed_root[0]) | (int(packed_root[1]) << 8) |
-              (int(packed_root[2]) << 16) | (int(packed_root[3]) << 24);
+    static cv::Vec3b PackComponentId(int component_id) {
+        return UnpackColor(static_cast<std::uint32_t>(component_id));
+    }
+
+    static int UnpackComponentId(const cv::Vec3b& packed_root) {
+        return static_cast<int>(LoadPacked(packed_root));
     }
 
 private:
@@ -459,10 +505,13 @@ private:
     static_assert(ColorCacheSize != 0 && (ColorCacheSize & (ColorCacheSize - 1)) == 0,
         "Color cache size must be a power of two");
 
-    static constexpr unsigned ComponentIdBits = 20;
-    static constexpr std::uint32_t ComponentIdMask = (std::uint32_t{1} << ComponentIdBits) - 1;
-    static constexpr std::uint32_t MaxRunLength = (std::uint32_t{1} << (32 - ComponentIdBits)) - 1;
-    static constexpr std::uint32_t BackgroundMarker = 0xFF000000u;
+    // First BGR pixel: two type bits + 22 payload bits. Type 11 is unused.
+    // 00: foreground singleton ID; 01: foreground length + full 24-bit ID in pixel 2;
+    // 10: background length. Width/node-capacity checks bound every stored value.
+    static constexpr std::uint32_t ExtendedForegroundRun = std::uint32_t{1} << 22;
+    static constexpr std::uint32_t BackgroundRun = std::uint32_t{1} << 23;
+    static constexpr std::uint32_t RunValueMask = ExtendedForegroundRun - 1;
+    static constexpr std::uint32_t MaxRunLength = RunValueMask;
 
     struct Run {
         int id;
@@ -474,9 +523,14 @@ private:
 
     struct UnionNode {
         std::uint32_t parent;
-        std::uint32_t size;
+        union {
+            std::uint32_t size;        // Used while establishing connectivity.
+            std::uint32_t final_color; // Used after all unions finish.
+        };
         int hist_id{-1};
     };
+    static_assert(sizeof(UnionNode) == 3 * sizeof(std::uint32_t),
+        "Caching final colors must not increase the node size");
 
     struct Unions {
         // Local traversal is valid during scanning, before cross-stripe unions.
@@ -750,7 +804,6 @@ private:
             }
             source.hists.free_slots.push_back(loser_hist);
         }
-        // Keep local hist_id values as color-cache addresses, including the loser's.
         // Freed slots cannot be reused until the next computation begins.
     }
 
@@ -767,7 +820,7 @@ private:
 
         GetNode(b).parent = EncodeParent(GetStripeId(b), a);
         GetNode(a).size += GetNode(b).size;
-        // Histograms retain their stripe-local IDs for the final color cache.
+        // Histogram IDs remain local to their owning stripes for the caller's merge.
         return {a, b};
     }
 

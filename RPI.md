@@ -52,3 +52,43 @@ reports median, mean, standard deviation, P95, min/max and reference PASS/FAIL.
 Image I/O is excluded. Results and JSON/CSV reports go into `build/bench/`.
 Change `--threads` to compare thread counts; add `--lifecycles reuse` to measure
 only buffer reuse. Keep cooling and background workload consistent between runs.
+
+The current RLE experiment keeps BGRA input/histograms and writes BGR output
+(alpha is omitted). Foreground runs of two or more pixels store tagged length
+and a 24-bit component ID in their first two pixels. Foreground singletons use
+one pixel with a 22-bit ID; background stores a tagged length in one pixel.
+Lengths fit 22 bits. Larger widths or singleton IDs use checked 24-bit ID headers
+and mask scans. Headers never extend outside their run.
+Copy `sources/RleAlgo.h`, `sources/IAlgo.h` and `sources/main.cpp` together when
+updating the Pi manually, then rebuild with the command above.
+
+## Profile with perf
+
+```sh
+sudo apt install -y linux-perf
+bash ./profile.sh 2 500
+```
+
+Arguments select execution threads and measured iterations (defaults: 2 and 500).
+The script builds an isolated Release executable with `-O3 -g`, then records
+samples, exports hotspots/annotated assembly and collects counters. It also saves
+100 unprofiled measurements for timing comparisons. Results, source/executable
+snapshots and metadata go into a timestamped directory under `build/perf/`.
+Run `bash ./profile.sh 1 500` for sequential profiling. Perf covers the whole
+process; use the unprofiled measurements for algorithm time. `sudo` is used for
+perf access without changing system profiling permissions.
+
+## Compare buffer fills
+
+After the normal build, run:
+
+```sh
+bash ./bench_fill.sh 30
+```
+
+This standalone benchmark compares `std::fill`, SIMD stores, SIMD stores with
+an alignment prefix, and `Mat::setTo`, using one/two threads. It tests small/full
+buffers, shifted addresses and foreground runs from the input mask. Each case
+verifies its pixels and buffer guards. CSV timings and source/executable snapshots
+go into `build/fill-bench/<timestamp>/`. Input loading and optional scan-like
+preparation are outside fill timing; this measures writes, not the whole algorithm.

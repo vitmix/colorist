@@ -225,7 +225,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Lifecycle: " << lifecycle
                   << (fresh ? " (Compute + instance destruction timed)\n" : " (Compute including reset timed)\n");
         // Allocate once outside all timers. Each algorithm paints every pixel on every call.
-        cv::Mat result(mask.size(), CV_8UC4);
+        cv::Mat result(mask.size(), algo->GetOutputType());
         for (int run = 0; run < warmup_runs; ++run) {
             auto warmup_algo = fresh ? CreateAlgo(algo_type, thread_count) : nullptr;
             (warmup_algo ? warmup_algo.get() : algo.get())->Compute(mask, color_mask, result);
