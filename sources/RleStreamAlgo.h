@@ -108,8 +108,6 @@ public:
 
         const int stripe_count = std::min(height, m_num_threads);
         m_stripes.resize(stripe_count);
-        ConfigureParentEncoding(stripe_count);
-        const std::uint64_t node_capacity = std::uint64_t{1} << m_parent_node_bits;
 
         ResetWorkingBuffers(height);
 
@@ -189,10 +187,10 @@ public:
                                         component_root_id = prev_root;
                                         uni.nodes[component_root_id].size++;
                                     } else {
-                                        const auto [winner, loser] = uni.UniteWinnerLoser(component_root_id, prev_root);
+                                        const auto [winner, loser] = uni.Unite(component_root_id, prev_root);
                                         if (loser != -1) {
-                                            hists.Merge(uni.GetHistId(winner), uni.GetHistId(loser));
-                                            uni.SetHistId(loser, -1);
+                                            hists.Merge(uni.nodes[winner].hist_id, uni.nodes[loser].hist_id);
+                                            uni.nodes[loser].hist_id = -1;
                                             MergeCompletion(stripe, winner, loser);
                                         }
                                         component_root_id = winner;
@@ -201,12 +199,7 @@ public:
 
                             // New component encountered, create it
                             if (component_root_id == -1) {
-                                if (Unlikely(uni.nodes.size() >= node_capacity)) {
-                                    CV_Error_(cv::Error::StsOutOfRange,
-                                        ("Stripe %d exceeds the tagged-parent capacity of %llu nodes (%u parent bits)",
-                                         i, static_cast<unsigned long long>(node_capacity), m_parent_node_bits));
-                                }
-                                component_root_id = uni.GetNewId();
+                                component_root_id = static_cast<int>(uni.nodes.size());
                                 uni.nodes.push_back({static_cast<std::uint32_t>(component_root_id), 1,
                                                      hists.AcquireSlot(), 0, y, y, false});
                                 ++stripe.active_by_row[y - stripe_begin];
@@ -214,7 +207,7 @@ public:
 
                             stripe.runs.back().id = component_root_id;
 
-                            const auto hist_id = uni.GetHistId(component_root_id);
+                            const auto hist_id = uni.nodes[component_root_id].hist_id;
                             int x = run_start;
                             while (x < c) {
                                 const auto color = LoadPacked(cmask_ptr[x]);
@@ -252,7 +245,7 @@ public:
                         for (int k = prev_begin; k < prev_end; ++k) {
                             const int root = uni.Root(stripe.runs[k].id);
                             const auto& state = stripe.uni.nodes[root];
-                            if (state.last_seen != y && !state.boundary && uni.GetHistId(root) >= 0)
+                            if (state.last_seen != y && !state.boundary && state.hist_id >= 0)
                                 FinalizeComponent(stripe, root);
                         }
 
@@ -267,18 +260,12 @@ public:
                     const auto [last_begin, last_end] = stripe.RowRange(stripe_rows - 1);
                     for (int k = last_begin; k < last_end; ++k) {
                         const int root = uni.Root(stripe.runs[k].id);
-                        if (!stripe.uni.nodes[root].boundary && uni.GetHistId(root) >= 0)
+                        const auto& state = uni.nodes[root];
+                        if (!state.boundary && state.hist_id >= 0)
                             FinalizeComponent(stripe, root);
                     }
                     while (painted < stripe_end)
                         PaintRow(stripe, painted++, width, output, m_zva_bytes);
-
-                    // Local root resolving
-                    for (std::size_t comp_id = 0; comp_id < uni.nodes.size(); ++comp_id) {
-                        const auto root = uni.Root(static_cast<int>(comp_id));
-                        uni.nodes[comp_id].parent = root;
-                        uni.nodes[comp_id].hist_id = uni.nodes[root].hist_id;
-                    }
                 }
             }, m_num_threads
         );
@@ -287,13 +274,24 @@ public:
         record_time(1);
 #endif
 
-        ValidateParentEncoding();
+        // Stripes used local node ids. Number them consecutively (global = base + local)
+        // and copy their links into one flat union-find for the cross-stripe merge.
+        m_base.assign(stripe_count + 1, 0);
+        for (int i = 0; i < stripe_count; ++i)
+            m_base[i + 1] = m_base[i] + static_cast<int>(m_stripes[i].uni.nodes.size());
+        auto& links = m_links.nodes;
+        links.resize(m_base[stripe_count]);
+        for (int i = 0; i < stripe_count; ++i) {
+            const auto& nodes = m_stripes[i].uni.nodes;
+            for (std::size_t k = 0; k < nodes.size(); ++k)
+                links[m_base[i] + k] = {static_cast<std::uint32_t>(m_base[i]) + nodes[k].parent, nodes[k].size};
+        }
 
-        // Local parents stay unchanged; only cross-stripe parents carry a tag.
+        // Join components across each internal edge: the upper stripe's last row
+        // against the lower stripe's first row.
         for (int i = 0; i + 1 < stripe_count; ++i) {
             const auto& upper = m_stripes[i];
             const auto& lower = m_stripes[i + 1];
-            // Upper stripe's last row against lower stripe's first row.
             auto [cursor, upper_end] = upper.RowRange(static_cast<int>(upper.row_start.size()) - 2);
             const auto [lower_begin, lower_end] = lower.RowRange(0);
 
@@ -301,37 +299,34 @@ public:
                 const auto& current = lower.runs[k];
                 ForEachOverlap(current, upper.runs, cursor, upper_end,
                     [&](const PaintRun& previous) {
-                        const auto [winner, loser] = ConnectBoundary(PackComponent(i, previous.id),
-                                                                      PackComponent(i + 1, current.id));
-                        if (loser != InvalidComponent)
+                        const auto [winner, loser] = m_links.Unite(m_base[i] + previous.id,
+                                                                   m_base[i + 1] + current.id);
+                        if (loser != -1)
                             MergeBoundaryHistograms(winner, loser);
                     });
             }
         }
-
-        for (int i = 0; i < stripe_count; ++i)
-            for (std::size_t id = 0; id < m_stripes[i].uni.nodes.size(); ++id)
-                GlobalRoot(PackComponent(i, static_cast<std::uint32_t>(id)));
+        m_links.ResolveAll();
 
 #ifdef COLORIST_TIMING
         record_time(2);
 #endif
 
-        for (auto& stripe : m_stripes) {
-            for (std::size_t id = 0; id < stripe.uni.nodes.size(); ++id) {
-                auto& node = stripe.uni.nodes[id];
-                if (node.parent != id || node.hist_id < 0)
-                    continue;
-                node.final_color = SelectColor(stripe, node.hist_id);
-            }
+        // One color per global root; components finished during the scan already have one.
+        for (int g = 0; g < m_base[stripe_count]; ++g) {
+            if (static_cast<int>(links[g].parent) != g)
+                continue;
+            const int i = StripeOf(g);
+            auto& node = m_stripes[i].uni.nodes[g - m_base[i]];
+            if (node.hist_id >= 0)
+                node.final_color = SelectColor(m_stripes[i], node.hist_id);
         }
 
+        // Cache each root's color on every node for the deferred pass.
         for (int i = 0; i < stripe_count; ++i) {
-            auto& stripe = m_stripes[i];
-            for (std::size_t id = 0; id < stripe.uni.nodes.size(); ++id) {
-                const auto root = ParentComponent(PackComponent(i, static_cast<std::uint32_t>(id)));
-                stripe.uni.nodes[id].final_color = GetNode(root).final_color;
-            }
+            auto& nodes = m_stripes[i].uni.nodes;
+            for (std::size_t k = 0; k < nodes.size(); ++k)
+                nodes[k].final_color = GlobalNode(static_cast<int>(links[m_base[i] + k].parent)).final_color;
         }
 #ifdef COLORIST_TIMING
         record_time(3);
@@ -438,10 +433,6 @@ private:
 
     int m_num_threads = 1;
     std::size_t m_zva_bytes = 0; // DC ZVA block size; zero disables zero-allocation.
-    static constexpr std::uint32_t CrossStripeParent = 0x80000000u;
-    static constexpr std::uint32_t InvalidComponent = 0;
-    unsigned m_parent_node_bits = 31;
-    std::uint32_t m_parent_node_mask = 0x7FFFFFFFu;
 
     static constexpr std::size_t ColorCacheSize = 64;
     static_assert(ColorCacheSize != 0 && (ColorCacheSize & (ColorCacheSize - 1)) == 0,
@@ -472,32 +463,44 @@ private:
         bool boundary;             // Touches an internal stripe edge: not counted, painted after reconciliation.
     };
 
+    // Cross-stripe link: global ids, no per-component state.
+    struct LinkNode {
+        std::uint32_t parent;
+        std::uint32_t size;
+    };
+
+    // Union-find with path halving and union by size. Node needs `parent` and `size`.
+    // Used per stripe during the scan (UnionNode) and once across stripes (LinkNode).
+    template<typename Node>
     struct Unions {
         int Root(int p) {
             while (p != static_cast<int>(nodes[p].parent)) {
                 nodes[p].parent = nodes[nodes[p].parent].parent;
-                p = nodes[p].parent;
+                p = static_cast<int>(nodes[p].parent);
             }
             return p;
         }
 
-        std::pair<int, int> UniteWinnerLoser(int p, int q) {
-            int root_p = Root(p);
-            int root_q = Root(q);
+        // Returns {winner, loser}; loser is -1 when p and q were already joined.
+        std::pair<int, int> Unite(int p, int q) {
+            const int root_p = Root(p);
+            const int root_q = Root(q);
             if (root_p == root_q)
                 return {root_p, -1};
-            int winner = nodes[root_p].size >= nodes[root_q].size ? root_p : root_q;
-            int loser = winner == root_p ? root_q : root_p;
+            const int winner = nodes[root_p].size >= nodes[root_q].size ? root_p : root_q;
+            const int loser = winner == root_p ? root_q : root_p;
             nodes[winner].size += nodes[loser].size;
-            nodes[loser].parent = winner;
+            nodes[loser].parent = static_cast<std::uint32_t>(winner);
             return {winner, loser};
         }
 
-        int GetNewId() const { return static_cast<int>(nodes.size()); }
-        int GetHistId(int node_id) const { return nodes[node_id].hist_id; }
-        void SetHistId(int node_id, int value) { nodes[node_id].hist_id = value; }
+        // Points every node directly at its root.
+        void ResolveAll() {
+            for (int p = 0; p < static_cast<int>(nodes.size()); ++p)
+                nodes[p].parent = static_cast<std::uint32_t>(Root(p));
+        }
 
-        std::vector<UnionNode> nodes;
+        std::vector<Node> nodes;
     };
 
     struct ColorIdEntry {
@@ -588,7 +591,7 @@ private:
             return id;
         }
 
-        Unions uni;
+        Unions<UnionNode> uni;
         Histograms hists;
         std::array<ColorCacheEntry, ColorCacheSize> color_cache{};
         std::vector<ColorIdEntry> color_ids;
@@ -694,103 +697,39 @@ private:
         FillBgrRun(out + x, width - x, 0);
     }
 
-    static bool Unlikely(bool condition) {
-#if defined(__GNUC__) || defined(__clang__)
-        return __builtin_expect(condition, false);
-#else
-        return condition;
-#endif
+    // Stripe owning a global node id; upper_bound skips stripes without nodes.
+    int StripeOf(int global) const {
+        return static_cast<int>(std::upper_bound(m_base.begin(), m_base.end(), global) - m_base.begin()) - 1;
     }
 
-    void ConfigureParentEncoding(int stripe_count) {
-        CV_Assert(stripe_count > 0);
-        unsigned stripe_bits = 0;
-        for (auto max_id = static_cast<std::uint32_t>(stripe_count - 1); max_id; max_id >>= 1)
-            ++stripe_bits;
-        m_parent_node_bits = 31 - stripe_bits;
-        m_parent_node_mask = (std::uint32_t{1} << m_parent_node_bits) - 1;
+    UnionNode& GlobalNode(int global) {
+        const int i = StripeOf(global);
+        return m_stripes[i].uni.nodes[global - m_base[i]];
     }
 
-    void ValidateParentEncoding() const {
-        const std::uint64_t capacity = std::uint64_t{1} << m_parent_node_bits;
-        for (std::size_t i = 0; i < m_stripes.size(); ++i) {
-            const auto count = m_stripes[i].uni.nodes.size();
-            if (Unlikely(count > capacity))
-                CV_Error_(cv::Error::StsOutOfRange,
-                    ("Stripe %zu has %zu nodes; tagged parents allow %llu nodes (%u node bits)",
-                     i, count, static_cast<unsigned long long>(capacity), m_parent_node_bits));
-        }
-    }
+    // Moves the loser root's histogram into the winner's, translating palette ids across stripes.
+    void MergeBoundaryHistograms(int winner, int loser) {
+        auto& destination = m_stripes[StripeOf(winner)];
+        auto& source = m_stripes[StripeOf(loser)];
+        const int winner_hist = GlobalNode(winner).hist_id;
+        auto& loser_node = GlobalNode(loser);
 
-    std::uint32_t PackComponent(int stripe_id, std::uint32_t node_id) const {
-        return CrossStripeParent | (static_cast<std::uint32_t>(stripe_id) << m_parent_node_bits) | node_id;
-    }
-
-    int GetStripeId(std::uint32_t component) const {
-        return static_cast<int>((component & ~CrossStripeParent) >> m_parent_node_bits);
-    }
-
-    UnionNode& GetNode(std::uint32_t component) {
-        return m_stripes[GetStripeId(component)].uni.nodes[component & m_parent_node_mask];
-    }
-
-    std::uint32_t ParentComponent(std::uint32_t component) {
-        const auto parent = GetNode(component).parent;
-        return (parent & CrossStripeParent) ? parent : PackComponent(GetStripeId(component), parent);
-    }
-
-    std::uint32_t EncodeParent(int owner_stripe, std::uint32_t parent) const {
-        return GetStripeId(parent) == owner_stripe ? (parent & m_parent_node_mask) : parent;
-    }
-
-    std::uint32_t GlobalRoot(std::uint32_t component) {
-        auto root = component;
-        for (;;) {
-            const auto parent = ParentComponent(root);
-            if (parent == root)
-                break;
-            root = parent;
-        }
-        while (component != root) {
-            const auto parent = ParentComponent(component);
-            auto& node = GetNode(component);
-            node.parent = EncodeParent(GetStripeId(component), root);
-            component = parent;
-        }
-        return root;
-    }
-
-    void MergeBoundaryHistograms(std::uint32_t winner, std::uint32_t loser) {
-        auto& destination = m_stripes[GetStripeId(winner)];
-        auto& source = m_stripes[GetStripeId(loser)];
-        const int winner_hist = GetNode(winner).hist_id;
-        const int loser_hist = GetNode(loser).hist_id;
-
-        if (GetStripeId(winner) == GetStripeId(loser)) {
-            destination.hists.Merge(winner_hist, loser_hist);
+        if (&destination == &source) {
+            destination.hists.Merge(winner_hist, loser_node.hist_id);
         } else {
-            const auto& counts = source.hists.Get(loser_hist);
+            const auto& counts = source.hists.Get(loser_node.hist_id);
             for (std::size_t color_id = 0; color_id < counts.size(); ++color_id) {
                 if (counts[color_id] == 0)
                     continue;
                 const auto destination_id = destination.GetColorId(source.palette[color_id]);
                 destination.hists.AddColorFreq(winner_hist, destination_id, counts[color_id]);
             }
-            source.hists.free_slots.push_back(loser_hist);
+            source.hists.free_slots.push_back(loser_node.hist_id);
         }
-    }
-
-    std::pair<std::uint32_t, std::uint32_t> ConnectBoundary(std::uint32_t a, std::uint32_t b) {
-        a = GlobalRoot(a);
-        b = GlobalRoot(b);
-        if (a == b)
-            return {a, InvalidComponent};
-        if (GetNode(a).size < GetNode(b).size)
-            std::swap(a, b);
-        GetNode(b).parent = EncodeParent(GetStripeId(b), a);
-        GetNode(a).size += GetNode(b).size;
-        return {a, b};
+        loser_node.hist_id = -1;
     }
 
     std::vector<Stripe> m_stripes;
+    std::vector<int> m_base;  // Global id of each stripe's node 0; the last entry is the total.
+    Unions<LinkNode> m_links; // Cross-stripe union-find over global ids.
 };
