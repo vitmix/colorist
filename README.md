@@ -9,6 +9,18 @@ inside it in `color_mask.png`. C++17, OpenCV 4.14 (`core`, `imgproc`, `imgcodecs
 
 ![Result for the task's 3840×2160 input](docs/result.png)
 
+Median time per frame (`bench.py`; image I/O excluded; `rle` output identical to the baseline's):
+
+| Machine | Algorithm | Threads | Reuse | Fresh |
+|---|---|---|---|---|
+| Windows i5-11400H, Clang 23 | `base_spaghetti` | 6 | 37.71 ms | 37.44 ms |
+| Windows i5-11400H, Clang 23 | `rle` | 6 | **4.32 ms** | **5.81 ms** |
+| Raspberry Pi 5, GCC 14.2 | `base_spaghetti` | 2 | 68.79 ms | 68.88 ms |
+| Raspberry Pi 5, GCC 14.2 | `rle` | 2 | **10.85 ms** | **11.92 ms** |
+
+100 runs each, except Raspberry Pi `base_spaghetti` (30 runs). `reuse` keeps one algorithm
+object; `fresh` creates a new one per run, so its working buffers are allocated again.
+
 The task's input images are not included; the commands below expect them in `test_task_CV_CPP/`.
 
 ## Build
@@ -89,20 +101,6 @@ Thread scaling, `rle`, reuse lifecycle (mean ms per frame):
 |---|---|---|---|---|---|---|---|
 | Raspberry Pi 5 | 19.41 | **10.85** | 11.08 | 11.79 | — | — | — |
 | Windows i5-11400H | 11.67 | 6.27 | 4.78 | 4.50 | **4.07** | 4.36 | 4.66 |
-
-## Results
-
-`bench.py`, median ms per frame; `rle` output is identical to the baseline's (PASS).
-100 runs each, except Raspberry Pi `base_spaghetti` (30 runs).
-
-| Machine | Algorithm | Threads | Reuse | Fresh |
-|---|---|---|---|---|
-| Windows i5-11400H, Clang 23 | `base_spaghetti` | 6 | 37.71 ms | 37.44 ms |
-| Windows i5-11400H, Clang 23 | `rle` | 6 | **4.32 ms** | **5.81 ms** |
-| Raspberry Pi 5, GCC 14.2 | `base_spaghetti` | 2 | 68.79 ms | 68.88 ms |
-| Raspberry Pi 5, GCC 14.2 | `rle` | 2 | **10.85 ms** | **11.92 ms** |
-
-`fresh` is slower because a new object allocates its working buffers again on every run.
 
 ## Benchmark and verification
 
