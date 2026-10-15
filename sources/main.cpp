@@ -34,9 +34,8 @@ CclAlgoType GetCclAlgoType(const std::string& ccl_algo) {
 }
 
 std::unique_ptr<IAlgo> CreateAlgo(const std::string& name, int num_threads = 1) {
-    if (name == "rle") {
+    if (name == "rle")
         return std::make_unique<RleAlgo>(num_threads);
-    }
 
     auto algo = std::make_unique<BaseAlgo>();
     algo->SetAlgoType(GetCclAlgoType(name));
@@ -139,7 +138,6 @@ int main(int argc, char* argv[]) {
         if (algo_type.empty()) {
             algo_type = "base_spaghetti";
         }
-        auto algo = CreateAlgo(algo_type);
         if (lifecycle.empty())
             lifecycle = "reuse";
         if (lifecycle != "reuse" && lifecycle != "fresh")
@@ -148,6 +146,7 @@ int main(int argc, char* argv[]) {
         const int warmup_runs = warmup_arg.empty() ? 0 : ParseCount(warmup_arg, "--warmup", 0);
         const int measured_runs = runs_arg.empty() ? 1 : ParseCount(runs_arg, "--runs", 1);
         const int requested_threads = threads_arg.empty() ? -1 : ParseCount(threads_arg, "--threads", 1);
+        auto algo = CreateAlgo(algo_type);
         if (!threads_arg.empty() && !parallel)
             throw std::runtime_error("--threads requires --parallel");
         const auto absolute_path = [](const std::string& path) {
@@ -171,7 +170,9 @@ int main(int argc, char* argv[]) {
         ShowImageInfo(mask);
 #endif
 
-        const cv::Mat color_mask = cv::imread(color_mask_path, cv::IMREAD_UNCHANGED);
+        // Decoding to the algorithm's pixel type is part of reading, so it stays untimed.
+        const cv::Mat color_mask = cv::imread(color_mask_path,
+            algo->GetColorMaskType() == CV_8UC3 ? cv::IMREAD_COLOR : cv::IMREAD_UNCHANGED);
         if (color_mask.empty()) {
             throw std::runtime_error("Cannot read color_mask: " + color_mask_path);
         }
@@ -181,7 +182,7 @@ int main(int argc, char* argv[]) {
         // Save the input preview before running the algorithm, outside its timer.
         {
             cv::Mat overlay;
-            cv::cvtColor(mask, overlay, cv::COLOR_GRAY2BGRA);
+            cv::cvtColor(mask, overlay, color_mask.channels() == 3 ? cv::COLOR_GRAY2BGR : cv::COLOR_GRAY2BGRA);
             cv::addWeighted(color_mask, 0.5, overlay, 0.5, 0.0, overlay);
             SaveImage("overlay.png", overlay);
             std::cout << "Saved overlay.png\n";
@@ -189,43 +190,24 @@ int main(int argc, char* argv[]) {
 #endif
 
         const bool supports_parallel = algo->SupportsParallelLabeling();
-        const bool stripe_labeling = algo_type == "rle";
         const bool supports_parallel_coloring = algo->SupportsParallelColoring();
         cv::setNumThreads(parallel && (supports_parallel || supports_parallel_coloring) ? requested_threads : 1);
         const int thread_count = cv::getNumThreads();
         algo->SetNumThreads(thread_count);
-        const int rows_per_thread = thread_count > 0 ? mask.rows / thread_count : 0;
-        const bool enough_rows = thread_count > 0 && rows_per_thread >= 2;
-        const bool parallel_labeling = supports_parallel && parallel && thread_count > 1 &&
-            (stripe_labeling ? mask.rows > 1 : enough_rows);
+        // RLE splits rows into stripes; OpenCV's parallel CCL needs at least two rows per thread.
+        const bool enough_rows = algo_type == "rle" ? mask.rows > 1
+                                                    : thread_count > 0 && mask.rows / thread_count >= 2;
+        const bool parallel_labeling = supports_parallel && parallel && thread_count > 1 && enough_rows;
         const bool parallel_coloring = supports_parallel_coloring && parallel && thread_count > 1 && mask.rows > 1;
-        std::cout << "Parallel requested: " << (parallel ? "yes" : "no")
-                  << " -- OpenCV threads: " << thread_count << '\n';
-        if (stripe_labeling) {
-            std::cout << "RLE stripes: " << std::min(mask.rows, thread_count)
-                      << " -- boundary reconciliation: sequential\n";
-        } else if (thread_count > 0) {
-            std::cout << "Row check: image.rows / cv::getNumThreads() >= 2: "
-                      << mask.rows << " / " << thread_count << " = " << rows_per_thread
-                      << " >= 2 -> " << (enough_rows ? "PASS" : "FAIL") << '\n';
-        } else {
-            std::cout << "Row check: unavailable (zero OpenCV threads)\n";
-        }
-        std::cout << "Connected components: "
-                  << (parallel_labeling ? "parallel version running" : "sequential version running")
-                  << '\n';
-        std::cout << "Final coloring: "
-                  << (parallel_coloring ? "parallel version running" : "sequential version running")
-                  << (parallel_coloring ? " (OpenCV parallel_for_)" : "")
-                  << '\n';
-
-        if (warmup_runs > 0 || measured_runs > 1) {
-            std::cout << "Warm-up runs: " << warmup_runs << " -- measured runs: " << measured_runs << '\n';
-        }
+        std::cout << "Algorithm: " << algo_type << " -- threads: " << thread_count
+                  << " -- labeling: " << (parallel_labeling ? "parallel" : "sequential")
+                  << " -- coloring: " << (parallel_coloring ? "parallel" : "sequential") << '\n';
         std::cout << "Lifecycle: " << lifecycle
-                  << (fresh ? " (Compute + instance destruction timed)\n" : " (Compute including reset timed)\n");
-        // Allocate once outside all timers. Each algorithm paints every pixel on every call.
-        cv::Mat result(mask.size(), CV_8UC4);
+                  << (fresh ? " (new instance per run; destruction timed)" : " (one instance reused)")
+                  << " -- warm-up runs: " << warmup_runs << " -- measured runs: " << measured_runs << '\n';
+
+        // Allocate once outside all timers. Each algorithm defines every pixel on every call.
+        cv::Mat result(mask.size(), algo->GetOutputType());
         for (int run = 0; run < warmup_runs; ++run) {
             auto warmup_algo = fresh ? CreateAlgo(algo_type, thread_count) : nullptr;
             (warmup_algo ? warmup_algo.get() : algo.get())->Compute(mask, color_mask, result);
