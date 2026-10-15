@@ -44,6 +44,8 @@ public:
     }
 
     int GetOutputType() const override { return CV_8UC3; }
+    // Alpha never decides a color here, so the color mask is read as BGR: 25% fewer input bytes.
+    int GetColorMaskType() const override { return CV_8UC3; }
     bool SupportsParallelLabeling() const override { return true; }
     bool SupportsParallelColoring() const override { return true; }
 
@@ -83,7 +85,7 @@ public:
 
     void Compute(const cv::Mat &mask, const cv::Mat &color_mask, cv::Mat& output) override {
         CV_Assert(mask.type() == CV_8UC1);
-        CV_Assert(color_mask.type() == CV_8UC4);
+        CV_Assert(color_mask.type() == GetColorMaskType());
         CV_Assert(mask.size() == color_mask.size());
         CV_Assert(!mask.empty());
         CV_Assert(output.type() == GetOutputType());
@@ -117,8 +119,8 @@ public:
 
         cv::parallel_for_(cv::Range(0, stripe_count),
             [&](const cv::Range& range) {
-                const int mask_block_sz = cv::VTraits<cv::v_uint8>::vlanes();
-                const int color_block_sz = cv::VTraits<cv::v_uint32>::vlanes();
+                // One block: a vector of mask bytes, or as many BGR pixels deinterleaved.
+                const int block_sz = cv::VTraits<cv::v_uint8>::vlanes();
                 const cv::v_uint8 cmp_block = cv::vx_setall_u8(127);
 
                 for (int i = range.start; i < range.end; ++i) {
@@ -141,7 +143,7 @@ public:
 
                     for (int y = stripe_begin; y < stripe_end; ++y) {
                         const auto* mask_ptr = mask.ptr<uchar>(y);
-                        const auto* cmask_ptr = color_mask.ptr<cv::Vec4b>(y);
+                        const auto* cmask_ptr = color_mask.ptr<uchar>(y); // BGR, 3 bytes per pixel
                         const bool edge_row = (y == stripe_begin && stripe_begin > 0) ||
                                               (y == stripe_end - 1 && stripe_end < height);
                         const int row = y - stripe_begin;
@@ -155,14 +157,14 @@ public:
 
                         while (c < width) {
                             // Skip background; it is painted with the row later.
-                            c = ScanWhile(c, width, mask_block_sz,
+                            c = ScanWhile(c, width, width, block_sz,
                                 [&](int at) { return cv::v_gt(cv::vx_load(mask_ptr + at), cmp_block); },
                                 [&](int at) { return mask_ptr[at] <= 127; });
                             if (c == width)
                                 break;
 
                             const int run_start = c;
-                            c = ScanWhile(c, width, mask_block_sz,
+                            c = ScanWhile(c, width, width, block_sz,
                                 [&](int at) { return cv::v_le(cv::vx_load(mask_ptr + at), cmp_block); },
                                 [&](int at) { return mask_ptr[at] > 127; });
 
@@ -200,15 +202,20 @@ public:
                             const auto hist_id = uni.nodes[component_root_id].hist_id;
                             int x = run_start;
                             while (x < c) {
-                                const auto color = LoadPacked(cmask_ptr[x]);
-                                const auto repeated_color = cv::vx_setall_u32(color);
+                                const auto color = LoadBgr(cmask_ptr + 3 * x);
+                                const auto blue = cv::vx_setall_u8(static_cast<uchar>(color));
+                                const auto green = cv::vx_setall_u8(static_cast<uchar>(color >> 8));
+                                const auto red = cv::vx_setall_u8(static_cast<uchar>(color >> 16));
                                 const int stretch_start = x;
-                                x = ScanWhile(x + 1, c, color_block_sz,
+                                // Blocks may extend past the run, but never past the row.
+                                x = ScanWhile(x + 1, c, width, block_sz,
                                     [&](int at) {
-                                        return cv::v_ne(cv::v_reinterpret_as_u32(cv::vx_load(
-                                            reinterpret_cast<const uchar*>(cmask_ptr + at))), repeated_color);
+                                        cv::v_uint8 b, g, r;
+                                        cv::v_load_deinterleave(cmask_ptr + 3 * at, b, g, r);
+                                        return cv::v_or(cv::v_or(cv::v_ne(b, blue), cv::v_ne(g, green)),
+                                                        cv::v_ne(r, red));
                                     },
-                                    [&](int at) { return LoadPacked(cmask_ptr[at]) == color; });
+                                    [&](int at) { return LoadBgr(cmask_ptr + 3 * at) == color; });
 
                                 if (!cache_valid || color != prev_color) {
                                     prev_color = color;
@@ -342,11 +349,14 @@ private:
 
     // Advances x towards end while scalar_match(x) holds. Whole blocks are tested first:
     // vector_mismatch(x) compares `lanes` elements at x, setting lanes that end the stretch.
+    // Blocks may be read up to `readable` (>= end); a match running past end stops at end.
     template<typename VectorMismatch, typename ScalarMatch>
-    static int ScanWhile(int x, int end, int lanes, VectorMismatch&& vector_mismatch,
+    static int ScanWhile(int x, int end, int readable, int lanes, VectorMismatch&& vector_mismatch,
                          ScalarMatch&& scalar_match) {
-        while (end - x >= lanes) {
+        while (x < end && readable - x >= lanes) {
             const int n = FirstSetLane(vector_mismatch(x));
+            if (x + n >= end)
+                return end;
             x += n;
             if (n < lanes)
                 return x;
@@ -404,10 +414,9 @@ private:
         }
     }
 
-    static inline std::uint32_t LoadPacked(const cv::Vec4b& pixel) {
-        std::uint32_t value;
-        std::memcpy(&value, &pixel, sizeof(value));
-        return value;
+    // Packs a BGR pixel as B | G << 8 | R << 16, the layout UnpackColor expects.
+    static inline std::uint32_t LoadBgr(const uchar* pixel) {
+        return std::uint32_t(pixel[0]) | (std::uint32_t(pixel[1]) << 8) | (std::uint32_t(pixel[2]) << 16);
     }
 
     static cv::Vec3b UnpackColor(std::uint32_t color) {

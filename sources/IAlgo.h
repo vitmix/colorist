@@ -11,6 +11,8 @@ class IAlgo {
 public:
     virtual ~IAlgo() = default;
     virtual int GetOutputType() const { return CV_8UC4; }
+    // Pixel type the color mask is decoded to (outside timing): BGRA, or BGR when alpha is unused.
+    virtual int GetColorMaskType() const { return CV_8UC4; }
     // Caller provides GetOutputType() storage of the input size; every pixel is overwritten.
     virtual void Compute(const cv::Mat& mask, const cv::Mat& color_mask, cv::Mat& output) = 0;
     virtual bool SupportsParallelLabeling() const { return false; }

@@ -181,7 +181,9 @@ int main(int argc, char* argv[]) {
         ShowImageInfo(mask);
 #endif
 
-        const cv::Mat color_mask = cv::imread(color_mask_path, cv::IMREAD_UNCHANGED);
+        // Decoding to the algorithm's pixel type is part of reading, so it stays untimed.
+        const cv::Mat color_mask = cv::imread(color_mask_path,
+            algo->GetColorMaskType() == CV_8UC3 ? cv::IMREAD_COLOR : cv::IMREAD_UNCHANGED);
         if (color_mask.empty()) {
             throw std::runtime_error("Cannot read color_mask: " + color_mask_path);
         }
@@ -191,7 +193,7 @@ int main(int argc, char* argv[]) {
         // Save the input preview before running the algorithm, outside its timer.
         {
             cv::Mat overlay;
-            cv::cvtColor(mask, overlay, cv::COLOR_GRAY2BGRA);
+            cv::cvtColor(mask, overlay, color_mask.channels() == 3 ? cv::COLOR_GRAY2BGR : cv::COLOR_GRAY2BGRA);
             cv::addWeighted(color_mask, 0.5, overlay, 0.5, 0.0, overlay);
             SaveImage("overlay.png", overlay);
             std::cout << "Saved overlay.png\n";
