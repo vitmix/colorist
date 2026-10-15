@@ -207,9 +207,8 @@ public:
                                          i, static_cast<unsigned long long>(node_capacity), m_parent_node_bits));
                                 }
                                 component_root_id = uni.GetNewId();
-                                uni.nodes.push_back({static_cast<std::uint32_t>(component_root_id),
-                                                     {1}, hists.AcquireSlot()});
-                                stripe.completion.push_back({y, y, false});
+                                uni.nodes.push_back({static_cast<std::uint32_t>(component_root_id), 1,
+                                                     hists.AcquireSlot(), 0, y, y, false});
                                 ++stripe.active_by_row[y - stripe_begin];
                             }
 
@@ -242,7 +241,7 @@ public:
                                                    static_cast<std::uint32_t>(x - stretch_start));
                             }
 
-                            auto& state = stripe.completion[component_root_id];
+                            auto& state = stripe.uni.nodes[component_root_id];
                             state.last_seen = y;
                             // Components touching internal stripe edges wait for reconciliation.
                             if (edge_row)
@@ -252,7 +251,7 @@ public:
                         // Previous-row components absent from this row are complete.
                         for (int k = prev_begin; k < prev_end; ++k) {
                             const int root = uni.Root(stripe.runs[k].id);
-                            const auto& state = stripe.completion[root];
+                            const auto& state = stripe.uni.nodes[root];
                             if (state.last_seen != y && !state.boundary && uni.GetHistId(root) >= 0)
                                 FinalizeComponent(stripe, root);
                         }
@@ -268,7 +267,7 @@ public:
                     const auto [last_begin, last_end] = stripe.RowRange(stripe_rows - 1);
                     for (int k = last_begin; k < last_end; ++k) {
                         const int root = uni.Root(stripe.runs[k].id);
-                        if (!stripe.completion[root].boundary && uni.GetHistId(root) >= 0)
+                        if (!stripe.uni.nodes[root].boundary && uni.GetHistId(root) >= 0)
                             FinalizeComponent(stripe, root);
                     }
                     while (painted < stripe_end)
@@ -414,8 +413,7 @@ private:
         for (auto& stripe : m_stripes) {
             stripe.runs.clear();
             stripe.deferred.clear();
-            stripe.completion.clear();
-            stripe.uni.nodes.clear();
+                        stripe.uni.nodes.clear();
             stripe.uni.nodes.reserve(expected_runs);
 
             auto& free_slots = stripe.hists.free_slots;
@@ -463,22 +461,16 @@ private:
         int y;
     };
 
-    struct Completion {
-        int first_row;  // Topmost row; keys this component in active_by_row while counted.
-        int last_seen;
-        bool boundary;  // Touches an internal stripe edge: not counted, painted after reconciliation.
-    };
-
+    // One union-find node per started component; fields beyond hist_id are meaningful on roots.
     struct UnionNode {
         std::uint32_t parent;
-        union {
-            std::uint32_t size;        // Used while establishing connectivity.
-            std::uint32_t final_color; // Used once this component is final.
-        };
-        int hist_id{-1};
+        std::uint32_t size;
+        int hist_id;               // Histogram slot; -1 once finished or merged away.
+        std::uint32_t final_color; // Set when the component is finished.
+        int first_row;             // Topmost row; keys this component in active_by_row while counted.
+        int last_seen;
+        bool boundary;             // Touches an internal stripe edge: not counted, painted after reconciliation.
     };
-    static_assert(sizeof(UnionNode) == 3 * sizeof(std::uint32_t),
-        "Caching final colors must not increase the node size");
 
     struct Unions {
         int Root(int p) {
@@ -605,7 +597,6 @@ private:
         std::vector<std::uint32_t> row_start;     // Stripe row -> first index in runs.
         std::vector<std::uint32_t> active_by_row; // Unfinished interior components by first row.
         std::vector<DeferredRun> deferred;
-        std::vector<Completion> completion;
         int begin{0};
 
         // Indices [first, last) of a stripe row's runs.
@@ -614,20 +605,20 @@ private:
         }
     };
 
-    static void Uncount(Stripe& stripe, const Completion& state) {
+    static void Uncount(Stripe& stripe, const UnionNode& state) {
         if (!state.boundary)
             --stripe.active_by_row[state.first_row - stripe.begin];
     }
 
     static void MarkBoundary(Stripe& stripe, int root) {
-        auto& state = stripe.completion[root];
+        auto& state = stripe.uni.nodes[root];
         Uncount(stripe, state);
         state.boundary = true;
     }
 
     static void MergeCompletion(Stripe& stripe, int winner, int loser) {
-        auto& a = stripe.completion[winner];
-        const auto& b = stripe.completion[loser];
+        auto& a = stripe.uni.nodes[winner];
+        const auto& b = stripe.uni.nodes[loser];
         Uncount(stripe, a);
         Uncount(stripe, b);
         a.first_row = std::min(a.first_row, b.first_row);
@@ -652,7 +643,7 @@ private:
         node.final_color = SelectColor(stripe, node.hist_id);
         stripe.hists.free_slots.push_back(node.hist_id);
         node.hist_id = -1;
-        Uncount(stripe, stripe.completion[root]);
+        Uncount(stripe, stripe.uni.nodes[root]);
     }
 
     // DC ZVA block size in bytes, or zero when unavailable or prohibited.
@@ -694,7 +685,7 @@ private:
             const auto& run = stripe.runs[k];
             FillBgrRun(out + x, run.x0 - x, 0);
             const int root = stripe.uni.Root(run.id);
-            if (stripe.completion[root].boundary)
+            if (stripe.uni.nodes[root].boundary)
                 stripe.deferred.push_back({static_cast<std::uint32_t>(k), y});
             else
                 FillBgrRun(out + run.x0, run.x1 - run.x0 + 1, stripe.uni.nodes[root].final_color);
