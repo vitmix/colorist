@@ -155,26 +155,16 @@ public:
 
                         while (c < width) {
                             // Skip background; it is painted with the row later.
-                            while (width - c >= mask_block_sz) {
-                                const int n = FirstSetLane(cv::v_gt(cv::vx_load(mask_ptr + c), cmp_block));
-                                c += n;
-                                if (n < mask_block_sz)
-                                    break;
-                            }
-                            while (c < width && mask_ptr[c] <= 127)
-                                ++c;
+                            c = ScanWhile(c, width, mask_block_sz,
+                                [&](int at) { return cv::v_gt(cv::vx_load(mask_ptr + at), cmp_block); },
+                                [&](int at) { return mask_ptr[at] <= 127; });
                             if (c == width)
                                 break;
 
                             const int run_start = c;
-                            while (width - c >= mask_block_sz) {
-                                const int n = FirstSetLane(cv::v_le(cv::vx_load(mask_ptr + c), cmp_block));
-                                c += n;
-                                if (n < mask_block_sz)
-                                    break;
-                            }
-                            while (c < width && mask_ptr[c] > 127)
-                                ++c;
+                            c = ScanWhile(c, width, mask_block_sz,
+                                [&](int at) { return cv::v_le(cv::vx_load(mask_ptr + at), cmp_block); },
+                                [&](int at) { return mask_ptr[at] > 127; });
 
                             stripe.runs.push_back({ run_start, c - 1, -1 });
 
@@ -212,18 +202,13 @@ public:
                             while (x < c) {
                                 const auto color = LoadPacked(cmask_ptr[x]);
                                 const auto repeated_color = cv::vx_setall_u32(color);
-                                const int stretch_start = x++;
-
-                                while (c - x >= color_block_sz) {
-                                    const auto pixels = cv::v_reinterpret_as_u32(
-                                        cv::vx_load(reinterpret_cast<const uchar*>(cmask_ptr + x)));
-                                    const int n = FirstSetLane(cv::v_ne(pixels, repeated_color));
-                                    x += n;
-                                    if (n < color_block_sz)
-                                        break;
-                                }
-                                while (x < c && LoadPacked(cmask_ptr[x]) == color)
-                                    ++x;
+                                const int stretch_start = x;
+                                x = ScanWhile(x + 1, c, color_block_sz,
+                                    [&](int at) {
+                                        return cv::v_ne(cv::v_reinterpret_as_u32(cv::vx_load(
+                                            reinterpret_cast<const uchar*>(cmask_ptr + at))), repeated_color);
+                                    },
+                                    [&](int at) { return LoadPacked(cmask_ptr[at]) == color; });
 
                                 if (!cache_valid || color != prev_color) {
                                     prev_color = color;
@@ -241,31 +226,14 @@ public:
                                 MarkBoundary(stripe, component_root_id);
                         }
 
-                        // Previous-row components absent from this row are complete.
-                        for (int k = prev_begin; k < prev_end; ++k) {
-                            const int root = uni.Root(stripe.runs[k].id);
-                            const auto& state = stripe.uni.nodes[root];
-                            if (state.last_seen != y && !state.boundary && state.hist_id >= 0)
-                                FinalizeComponent(stripe, root);
-                        }
-
                         stripe.row_start[row + 1] = static_cast<std::uint32_t>(stripe.runs.size());
-
-                        // Rows above the first unfinished interior component are final.
-                        while (painted <= y && stripe.active_by_row[painted - stripe_begin] == 0)
-                            PaintRow(stripe, painted++, width, output, m_zva_bytes);
+                        CloseRow(stripe, prev_begin, prev_end, y, painted, width, output);
                     }
 
-                    // The image bottom is definite; internal stripe edges remain pending.
+                    // No row follows the last one: its components end here, except those
+                    // touching an internal stripe edge, which wait for reconciliation.
                     const auto [last_begin, last_end] = stripe.RowRange(stripe_rows - 1);
-                    for (int k = last_begin; k < last_end; ++k) {
-                        const int root = uni.Root(stripe.runs[k].id);
-                        const auto& state = uni.nodes[root];
-                        if (!state.boundary && state.hist_id >= 0)
-                            FinalizeComponent(stripe, root);
-                    }
-                    while (painted < stripe_end)
-                        PaintRow(stripe, painted++, width, output, m_zva_bytes);
+                    CloseRow(stripe, last_begin, last_end, stripe_end, painted, width, output);
                 }
             }, m_num_threads
         );
@@ -370,6 +338,22 @@ private:
         return cv::v_check_any(comparison) ? cv::v_scan_forward(comparison)
                                            : cv::VTraits<Vec>::vlanes();
 #endif
+    }
+
+    // Advances x towards end while scalar_match(x) holds. Whole blocks are tested first:
+    // vector_mismatch(x) compares `lanes` elements at x, setting lanes that end the stretch.
+    template<typename VectorMismatch, typename ScalarMatch>
+    static int ScanWhile(int x, int end, int lanes, VectorMismatch&& vector_mismatch,
+                         ScalarMatch&& scalar_match) {
+        while (end - x >= lanes) {
+            const int n = FirstSetLane(vector_mismatch(x));
+            x += n;
+            if (n < lanes)
+                return x;
+        }
+        while (x < end && scalar_match(x))
+            ++x;
+        return x;
     }
 
     static void FillBgrRun(cv::Vec3b* destination, int length, std::uint32_t packed_color) {
@@ -695,6 +679,24 @@ private:
             x = run.x1 + 1;
         }
         FillBgrRun(out + x, width - x, 0);
+    }
+
+    // Row y is scanned. Finishes the components of runs [first, last) (the previous row)
+    // that row y did not continue, then paints every row whose components are all final.
+    // After the last row, y = stripe end: every remaining interior component finishes.
+    void CloseRow(Stripe& stripe, int first, int last, int y, int& painted, int width, cv::Mat& output) {
+        auto& uni = stripe.uni;
+        for (int k = first; k < last; ++k) {
+            const int root = uni.Root(stripe.runs[k].id);
+            const auto& state = uni.nodes[root];
+            if (state.last_seen != y && !state.boundary && state.hist_id >= 0)
+                FinalizeComponent(stripe, root);
+        }
+
+        // Rows above the first unfinished interior component are final.
+        const int last_row = std::min(y, stripe.begin + static_cast<int>(stripe.active_by_row.size()) - 1);
+        while (painted <= last_row && stripe.active_by_row[painted - stripe.begin] == 0)
+            PaintRow(stripe, painted++, width, output, m_zva_bytes);
     }
 
     // Stripe owning a global node id; upper_bound skips stripes without nodes.
