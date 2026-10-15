@@ -39,8 +39,9 @@
 //   before painting, so stores don't first read those lines from DRAM.
 class RleStreamAlgo : public IAlgo {
 public:
-    explicit RleStreamAlgo(int num_threads = 1, bool zero_allocate = true)
-        : m_zva_bytes(zero_allocate ? ZvaBlockBytes() : 0) { SetNumThreads(num_threads); }
+    explicit RleStreamAlgo(int num_threads = 1) : m_zva_bytes(ZvaBlockBytes()) {
+        SetNumThreads(num_threads);
+    }
 
     int GetOutputType() const override { return CV_8UC3; }
     bool SupportsParallelLabeling() const override { return true; }
@@ -135,12 +136,6 @@ public:
                     auto& uni = stripe.uni;
                     auto& hists = stripe.hists;
 
-                    auto& curr_run_row = stripe.temp_row;
-                    auto& prev_run_row = stripe.last_row;
-                    prev_run_row.clear();
-                    curr_run_row.clear();
-                    stripe.first_row.clear();
-
                     std::uint32_t prev_color = 0;
                     std::size_t prev_color_id = 0;
                     bool cache_valid = false;
@@ -151,10 +146,14 @@ public:
                         const auto* cmask_ptr = color_mask.ptr<cv::Vec4b>(y);
                         const bool edge_row = (y == stripe_begin && stripe_begin > 0) ||
                                               (y == stripe_end - 1 && stripe_end < height);
-                        stripe.row_start[y - stripe_begin] = static_cast<std::uint32_t>(stripe.runs.size());
+                        const int row = y - stripe_begin;
+                        stripe.row_start[row] = static_cast<std::uint32_t>(stripe.runs.size());
 
                         int c = 0;
-                        int cursor = 0;
+                        // Previous row's runs; empty on the stripe's first row.
+                        const auto [prev_begin, prev_end] = row > 0 ? stripe.RowRange(row - 1)
+                                                                    : std::pair<int, int>{0, 0};
+                        int cursor = prev_begin;
 
                         while (c < width) {
                             // Skip background; it is painted with the row later.
@@ -179,41 +178,44 @@ public:
                             while (c < width && mask_ptr[c] > 127)
                                 ++c;
 
-                            const Run current{ -1, run_start, c - 1 };
-                            int component_root = -1;
+                            stripe.runs.push_back({ run_start, c - 1, -1 });
 
-                            ForEachOverlap(current, prev_run_row, cursor,
-                                [&](const Run& prev_run) {
+                            int component_root_id = -1;
+
+                            ForEachOverlap(stripe.runs.back(), stripe.runs, cursor, prev_end,
+                                [&](const PaintRun& prev_run) {
                                     const auto prev_root = uni.Root(prev_run.id);
-                                    if (component_root == -1) {
-                                        component_root = prev_root;
-                                        uni.nodes[component_root].size++;
+                                    if (component_root_id == -1) {
+                                        component_root_id = prev_root;
+                                        uni.nodes[component_root_id].size++;
                                     } else {
-                                        const auto [winner, loser] = uni.UniteWinnerLoser(component_root, prev_root);
+                                        const auto [winner, loser] = uni.UniteWinnerLoser(component_root_id, prev_root);
                                         if (loser != -1) {
                                             hists.Merge(uni.GetHistId(winner), uni.GetHistId(loser));
                                             uni.SetHistId(loser, -1);
                                             MergeCompletion(stripe, winner, loser);
                                         }
-                                        component_root = winner;
+                                        component_root_id = winner;
                                     }
                                 });
 
-                            if (component_root == -1) {
-                                if (Unlikely(uni.nodes.size() >= node_capacity))
+                            // New component encountered, create it
+                            if (component_root_id == -1) {
+                                if (Unlikely(uni.nodes.size() >= node_capacity)) {
                                     CV_Error_(cv::Error::StsOutOfRange,
                                         ("Stripe %d exceeds the tagged-parent capacity of %llu nodes (%u parent bits)",
                                          i, static_cast<unsigned long long>(node_capacity), m_parent_node_bits));
-                                component_root = uni.GetId();
-                                uni.nodes.push_back({static_cast<std::uint32_t>(component_root),
+                                }
+                                component_root_id = uni.GetNewId();
+                                uni.nodes.push_back({static_cast<std::uint32_t>(component_root_id),
                                                      {1}, hists.AcquireSlot()});
                                 stripe.completion.push_back({y, y, false});
                                 ++stripe.active_by_row[y - stripe_begin];
                             }
 
-                            curr_run_row.push_back({component_root, run_start, c - 1});
+                            stripe.runs.back().id = component_root_id;
 
-                            const auto hist_id = uni.GetHistId(component_root);
+                            const auto hist_id = uni.GetHistId(component_root_id);
                             int x = run_start;
                             while (x < c) {
                                 const auto color = LoadPacked(cmask_ptr[x]);
@@ -240,36 +242,32 @@ public:
                                                    static_cast<std::uint32_t>(x - stretch_start));
                             }
 
-                            stripe.runs.push_back({run_start, c - run_start, component_root});
-                            auto& state = stripe.completion[component_root];
+                            auto& state = stripe.completion[component_root_id];
                             state.last_seen = y;
                             // Components touching internal stripe edges wait for reconciliation.
                             if (edge_row)
-                                MarkBoundary(stripe, component_root);
+                                MarkBoundary(stripe, component_root_id);
                         }
 
                         // Previous-row components absent from this row are complete.
-                        for (const auto& run : prev_run_row) {
-                            const int root = uni.Root(run.id);
+                        for (int k = prev_begin; k < prev_end; ++k) {
+                            const int root = uni.Root(stripe.runs[k].id);
                             const auto& state = stripe.completion[root];
                             if (state.last_seen != y && !state.boundary && uni.GetHistId(root) >= 0)
                                 FinalizeComponent(stripe, root);
                         }
-                        stripe.row_start[y - stripe_begin + 1] = static_cast<std::uint32_t>(stripe.runs.size());
+
+                        stripe.row_start[row + 1] = static_cast<std::uint32_t>(stripe.runs.size());
 
                         // Rows above the first unfinished interior component are final.
                         while (painted <= y && stripe.active_by_row[painted - stripe_begin] == 0)
                             PaintRow(stripe, painted++, width, output, m_zva_bytes);
-
-                        std::swap(prev_run_row, curr_run_row);
-                        if (y == stripe_begin)
-                            stripe.first_row = prev_run_row;
-                        curr_run_row.clear();
                     }
 
                     // The image bottom is definite; internal stripe edges remain pending.
-                    for (const auto& run : prev_run_row) {
-                        const int root = uni.Root(run.id);
+                    const auto [last_begin, last_end] = stripe.RowRange(stripe_rows - 1);
+                    for (int k = last_begin; k < last_end; ++k) {
+                        const int root = uni.Root(stripe.runs[k].id);
                         if (!stripe.completion[root].boundary && uni.GetHistId(root) >= 0)
                             FinalizeComponent(stripe, root);
                     }
@@ -294,13 +292,16 @@ public:
 
         // Local parents stay unchanged; only cross-stripe parents carry a tag.
         for (int i = 0; i + 1 < stripe_count; ++i) {
-            auto& upper = m_stripes[i];
-            auto& lower = m_stripes[i + 1];
-            int cursor = 0;
+            const auto& upper = m_stripes[i];
+            const auto& lower = m_stripes[i + 1];
+            // Upper stripe's last row against lower stripe's first row.
+            auto [cursor, upper_end] = upper.RowRange(static_cast<int>(upper.row_start.size()) - 2);
+            const auto [lower_begin, lower_end] = lower.RowRange(0);
 
-            for (const auto& current : lower.first_row) {
-                ForEachOverlap(current, upper.last_row, cursor,
-                    [&](const Run& previous) {
+            for (int k = lower_begin; k < lower_end; ++k) {
+                const auto& current = lower.runs[k];
+                ForEachOverlap(current, upper.runs, cursor, upper_end,
+                    [&](const PaintRun& previous) {
                         const auto [winner, loser] = ConnectBoundary(PackComponent(i, previous.id),
                                                                       PackComponent(i + 1, current.id));
                         if (loser != InvalidComponent)
@@ -344,7 +345,7 @@ public:
                     auto& stripe = m_stripes[i];
                     for (const auto& deferred : stripe.deferred) {
                         const auto& run = stripe.runs[deferred.run];
-                        FillBgrRun(output.ptr<cv::Vec3b>(deferred.y) + run.x0, run.length,
+                        FillBgrRun(output.ptr<cv::Vec3b>(deferred.y) + run.x0, run.x1 - run.x0 + 1,
                                    stripe.uni.nodes[run.id].final_color);
                     }
                 }
@@ -448,19 +449,14 @@ private:
     static_assert(ColorCacheSize != 0 && (ColorCacheSize & (ColorCacheSize - 1)) == 0,
         "Color cache size must be a power of two");
 
-    struct Run {
-        int id;
-        int x0;
-        int x1;
-    };
-    using Runs = std::vector<Run>;
-
     // Row-ordered runs; the row is implied by Stripe::row_start.
     struct PaintRun {
         int x0;
-        int length;
+        int x1; // Inclusive.
         int id; // Node at the time of the scan; resolve with Root().
     };
+
+    using PaintRuns = std::vector<PaintRun>;
 
     struct DeferredRun {
         std::uint32_t run;
@@ -505,7 +501,7 @@ private:
             return {winner, loser};
         }
 
-        int GetId() const { return static_cast<int>(nodes.size()); }
+        int GetNewId() const { return static_cast<int>(nodes.size()); }
         int GetHistId(int node_id) const { return nodes[node_id].hist_id; }
         void SetHistId(int node_id, int value) { nodes[node_id].hist_id = value; }
 
@@ -562,9 +558,9 @@ private:
     };
 
     template<typename OnOverlap>
-    static void ForEachOverlap(const Run& current, const Runs& previous, int& cursor, OnOverlap&& on_overlap) {
-        while (cursor != static_cast<int>(previous.size())) {
-            const Run& prev_run = previous[cursor];
+    static void ForEachOverlap(const PaintRun& current, const PaintRuns& previous, int& cursor, const int stop, OnOverlap&& on_overlap) {
+        while (cursor != stop) {
+            const PaintRun& prev_run = previous[cursor];
             if (prev_run.x1 < current.x0) {
                 ++cursor;
                 continue;
@@ -605,13 +601,17 @@ private:
         std::array<ColorCacheEntry, ColorCacheSize> color_cache{};
         std::vector<ColorIdEntry> color_ids;
         std::vector<std::uint32_t> palette;
-        std::vector<Run> first_row, last_row, temp_row;
         std::vector<PaintRun> runs;
         std::vector<std::uint32_t> row_start;     // Stripe row -> first index in runs.
         std::vector<std::uint32_t> active_by_row; // Unfinished interior components by first row.
         std::vector<DeferredRun> deferred;
         std::vector<Completion> completion;
         int begin{0};
+
+        // Indices [first, last) of a stripe row's runs.
+        std::pair<int, int> RowRange(int row) const {
+            return {static_cast<int>(row_start[row]), static_cast<int>(row_start[row + 1])};
+        }
     };
 
     static void Uncount(Stripe& stripe, const Completion& state) {
@@ -688,17 +688,17 @@ private:
         auto* out = output.ptr<cv::Vec3b>(y);
         if (zva_bytes)
             ZeroAllocate(out, std::size_t(width) * sizeof(cv::Vec3b), zva_bytes);
-        const int row = y - stripe.begin;
+        const auto [first, last] = stripe.RowRange(y - stripe.begin);
         int x = 0;
-        for (auto k = stripe.row_start[row]; k < stripe.row_start[row + 1]; ++k) {
+        for (int k = first; k < last; ++k) {
             const auto& run = stripe.runs[k];
             FillBgrRun(out + x, run.x0 - x, 0);
             const int root = stripe.uni.Root(run.id);
             if (stripe.completion[root].boundary)
-                stripe.deferred.push_back({k, y});
+                stripe.deferred.push_back({static_cast<std::uint32_t>(k), y});
             else
-                FillBgrRun(out + run.x0, run.length, stripe.uni.nodes[root].final_color);
-            x = run.x0 + run.length;
+                FillBgrRun(out + run.x0, run.x1 - run.x0 + 1, stripe.uni.nodes[root].final_color);
+            x = run.x1 + 1;
         }
         FillBgrRun(out + x, width - x, 0);
     }

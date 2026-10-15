@@ -40,8 +40,8 @@ std::unique_ptr<IAlgo> CreateAlgo(const std::string& name, int num_threads = 1, 
         algo->SetColorBatch(color_batch);
         return algo;
     }
-    if (name == "rle_stream" || name == "rle_stream_nozva")
-        return std::make_unique<RleStreamAlgo>(num_threads, name == "rle_stream");
+    if (name == "rle_stream")
+        return std::make_unique<RleStreamAlgo>(num_threads);
 
     auto algo = std::make_unique<BaseAlgo>();
     algo->SetAlgoType(GetCclAlgoType(name));
@@ -92,7 +92,7 @@ void ShowImageInfo(const cv::Mat& img) {
 int main(int argc, char* argv[]) {
     constexpr auto usage =
         "Usage: colorist --mask <mask.png> --color_mask <color_mask.png> --output <result.png>\n"
-        "                [--algo-type <base_spaghetti|base_sauf|base_bbdt|rle|rle_stream|rle_stream_nozva>] [--parallel [--threads <count>]]\n"
+        "                [--algo-type <base_spaghetti|base_sauf|base_bbdt|rle|rle_stream>] [--parallel [--threads <count>]]\n"
         "                [--lifecycle <reuse|fresh>] [--warmup <count>] [--runs <count>]\n"
         "                [--color-batch <segments-per-row>] (RLE only; 0 = immediate completion painting)\n"
         "                [--metrics <measurements.json>]\n";
@@ -199,7 +199,7 @@ int main(int argc, char* argv[]) {
 #endif
 
         const bool supports_parallel = algo->SupportsParallelLabeling();
-        const bool stripe_labeling = algo_type == "rle" || algo_type.rfind("rle_stream", 0) == 0;
+        const bool stripe_labeling = algo_type == "rle" || algo_type == "rle_stream";
         const bool supports_parallel_coloring = algo->SupportsParallelColoring();
         cv::setNumThreads(parallel && (supports_parallel || supports_parallel_coloring) ? requested_threads : 1);
         const int thread_count = cv::getNumThreads();

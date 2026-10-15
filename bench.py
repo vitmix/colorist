@@ -18,7 +18,7 @@ import sys
 
 
 ALGORITHMS = ("base_spaghetti", "base_sauf", "base_bbdt")
-RLE_ALGORITHMS = ("rle", "rle_stream", "rle_stream_nozva")
+RLE_ALGORITHMS = ("rle", "rle_stream")
 MODES = ("sequential", "parallel")
 LIFECYCLES = ("reuse", "fresh")
 STAGES = ("threshold_ms", "ccl_ms", "histogram_ms", "color_selection_ms", "final_coloring_ms")
