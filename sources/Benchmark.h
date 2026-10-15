@@ -23,7 +23,7 @@ inline void SaveMeasurements(const std::string& filename, const std::string& alg
                              bool parallel_requested, bool parallel_labeling, bool parallel_coloring, int threads,
                              const cv::Mat& mask, int connectivity, int warmup_runs,
                              const std::vector<Measurement>& measurements, const IAlgo& algo,
-                             const std::string& lifecycle, int color_batch = 0)
+                             const std::string& lifecycle)
 {
     cv::FileStorage file(filename, cv::FileStorage::WRITE | cv::FileStorage::FORMAT_JSON);
     if (!file.isOpened())
@@ -46,7 +46,6 @@ inline void SaveMeasurements(const std::string& filename, const std::string& alg
     file << "schema_version" << 1 << "metadata" << "{"
          << "algorithm_requested" << algorithm
          << "lifecycle" << lifecycle
-         << "color_batch" << color_batch
          << "output_allocation_timed" << 0 << "output_buffer_reused" << 1
          << "algorithm_effective" << (algorithm == "base_bbdt" && connectivity == 4 ? "base_sauf" : algorithm)
          << "parallel_requested" << int(parallel_requested)

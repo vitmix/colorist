@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Native Linux profiling: bash ./profile.sh [threads=2] [runs=500] [algo=rle_stream]
+# Native Linux profiling: bash ./profile.sh [threads=2] [runs=500] [algo=rle]
 root=$(cd -- "$(dirname -- "$0")" && pwd)
 cd "$root"
 threads=${1:-2}
 runs=${2:-500}
-algo=${3:-rle_stream}
+algo=${3:-rle}
 jobs=${JOBS:-2}
 for count in "$threads" "$runs" "$jobs"; do
     [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo 'Threads, runs and JOBS must be positive integers' >&2; exit 1; }
 done
 [[ $# -le 3 ]] || { echo 'Usage: bash ./profile.sh [threads] [runs] [algo]' >&2; exit 1; }
 case "$algo" in
-    rle|rle_stream|base_spaghetti|base_sauf|base_bbdt) ;;
+    rle|base_spaghetti|base_sauf|base_bbdt) ;;
     *) echo "Unknown algo: $algo" >&2; exit 1 ;;
 esac
 command -v perf >/dev/null || { echo 'Install perf: sudo apt install linux-perf' >&2; exit 1; }
@@ -50,7 +50,7 @@ echo 'Building Release with -O3 -g...'
     -DCOLORIST_DEBUG=OFF -DCOLORIST_TIMING=ON > "$out/build.log" 2>&1
 "$cmake" --build "$build" --parallel "$jobs" >> "$out/build.log" 2>&1
 cp "$build/colorist" "$out/colorist"
-cp sources/RleAlgo.h sources/RleStreamAlgo.h "$out/"
+cp sources/RleAlgo.h "$out/"
 cp "$build/compile_commands.json" "$out/compile_commands.json"
 app=("$out/colorist" --mask "$root/test_task_CV_CPP/mask.png"
     --color_mask "$root/test_task_CV_CPP/color_mask.png" --output "$out/result.png"
@@ -63,7 +63,7 @@ if [[ "$threads" -gt 1 ]]; then app+=(--parallel --threads "$threads"); fi
     if [[ -f /proc/device-tree/model ]]; then tr -d '\0' < /proc/device-tree/model; echo; fi
     perf --version
     printf 'Algorithm: %s\nThreads: %s\nMeasured runs: %s\nWarm-up runs: 20\n' "$algo" "$threads" "$runs"
-    sha256sum "$out/colorist" sources/RleAlgo.h sources/RleStreamAlgo.h test_task_CV_CPP/{mask,color_mask}.png
+    sha256sum "$out/colorist" sources/RleAlgo.h test_task_CV_CPP/{mask,color_mask}.png
     if command -v vcgencmd >/dev/null; then vcgencmd get_throttled; vcgencmd measure_clock arm; fi
 } > "$out/environment.txt"
 perf list > "$out/events.txt" 2>&1
@@ -79,16 +79,16 @@ fi
 printf 'Sampling event: %s\n' "$event" >> "$out/environment.txt"
 echo "Recording $runs iterations ($event)..."
 "${perf_cmd[@]}" record -e "$event" -F 499 --call-graph dwarf \
-    -o "$out/rle.data" -- "${app[@]}" --warmup 20 --runs "$runs" \
+    -o "$out/perf.data" -- "${app[@]}" --warmup 20 --runs "$runs" \
     --metrics "$out/recorded.json" > "$out/record.log" 2> "$out/record-perf.log"
 
 echo 'Exporting hotspots, thread breakdown and annotated assembly...'
-"${perf_cmd[@]}" report -i "$out/rle.data" --stdio --no-children --call-graph none --sort symbol \
+"${perf_cmd[@]}" report -i "$out/perf.data" --stdio --no-children --call-graph none --sort symbol \
     > "$out/hotspots.txt" 2> "$out/report-errors.txt"
-"${perf_cmd[@]}" report -i "$out/rle.data" --stdio --no-children --call-graph none --sort comm,pid,symbol \
+"${perf_cmd[@]}" report -i "$out/perf.data" --stdio --no-children --call-graph none --sort comm,pid,symbol \
     > "$out/threads.txt" 2>> "$out/report-errors.txt"
 [[ -s "$out/hotspots.txt" && -s "$out/threads.txt" ]] || { echo 'Perf report export is empty' >&2; exit 1; }
-"${perf_cmd[@]}" annotate -i "$out/rle.data" --stdio --source \
+"${perf_cmd[@]}" annotate -i "$out/perf.data" --stdio --source \
     > "$out/assembly.txt" 2> "$out/annotate-errors.txt"
 
 echo 'Collecting hardware counters (three repetitions)...'

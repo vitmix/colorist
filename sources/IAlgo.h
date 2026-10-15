@@ -5,6 +5,9 @@
 
 #ifdef COLORIST_TIMING
 #include <array>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 #endif
 
 class IAlgo {
@@ -20,8 +23,19 @@ public:
     virtual void SetNumThreads(int) {}
 #ifdef COLORIST_TIMING
     virtual const std::array<double, 5>& GetTimings() const = 0;
-    virtual const std::array<const char*, 5>& GetTimingKeys() const = 0;
-    virtual void PrintTimings(const std::array<double, 5>& timings) const = 0;
-    void PrintTimings() const { PrintTimings(GetTimings()); }
+    virtual const std::array<const char*, 5>& GetTimingKeys() const = 0;  // Metrics JSON keys.
+    virtual const std::array<const char*, 5>& GetStageNames() const = 0;  // Table labels.
+
+    void PrintTimings(const std::array<double, 5>& timings) const {
+        const char* border = "+------------------+-----------+\n";
+        std::ostringstream table;
+        table << '\n' << border << "| Stage            |        ms |\n" << border
+              << std::fixed << std::setprecision(3);
+        for (std::size_t i = 0; i < timings.size(); ++i)
+            table << "| " << std::left << std::setw(16) << GetStageNames()[i]
+                  << " | " << std::right << std::setw(9) << timings[i] << " |\n";
+        table << border;
+        std::cout << table.str();
+    }
 #endif
 };

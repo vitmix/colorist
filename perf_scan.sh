@@ -1,13 +1,13 @@
 #!/bin/bash
 # Per-frame hardware counters vs thread count, for answering "why doesn't it scale".
 # Usage (from the project root on the Pi, after `JOBS=2 sh ./build.sh --algo-timing`):
-#   bash ./perf_scan.sh [algos...]          default: rle_stream rle
+#   bash ./perf_scan.sh [algos...]          default: rle
 # Each config runs with 20 and 220 measured frames; the difference / 200 removes
 # image load/save and process startup, leaving pure Compute() cost per frame.
 set -euo pipefail
 
 ALGOS=("$@")
-[ $# -eq 0 ] && ALGOS=(rle_stream rle)
+[ $# -eq 0 ] && ALGOS=(rle)
 THREADS=(1 2 3 4)
 SHORT=20
 LONG=220
@@ -38,7 +38,7 @@ echo "group A: $EV_A"; echo "group B: $EV_B"
 {
     date -u; uname -a; cat /proc/device-tree/model 2>/dev/null | tr -d '\0'; echo
     vcgencmd get_throttled 2>/dev/null || true
-    sha256sum "$EXE" sources/RleStreamAlgo.h sources/RleAlgo.h
+    sha256sum "$EXE" sources/RleAlgo.h
 } > "$OUT/environment.txt"
 
 run() {  # algo threads frames group_name events

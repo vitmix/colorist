@@ -13,7 +13,7 @@
 #include <chrono>
 #endif
 
-#if defined(COLORIST_DEBUG) || defined(COLORIST_TIMING)
+#ifdef COLORIST_DEBUG
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -43,23 +43,12 @@ public:
         return keys;
     }
 
-    using IAlgo::PrintTimings;
-    void PrintTimings(const std::array<double, 5>& timings) const override
+    const std::array<const char*, 5>& GetStageNames() const override
     {
-        static constexpr const char* stages[] = {
+        static constexpr std::array<const char*, 5> names = {
             "Threshold", "CCL", "Histogram", "Color selection", "Final coloring"
         };
-        const char* border = "+-----------------+-----------+\n";
-        std::ostringstream table;
-        table << '\n' << border << "| Stage           |        ms |\n" << border
-              << std::fixed << std::setprecision(3);
-        for (std::size_t i = 0; i < timings.size(); ++i)
-        {
-            table << "| " << std::left << std::setw(15) << stages[i]
-                  << " | " << std::right << std::setw(9) << timings[i] << " |\n";
-        }
-        table << border;
-        std::cout << table.str();
+        return names;
     }
 #endif
 
