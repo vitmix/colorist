@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Native Linux profiling: bash ./profile.sh [threads=2] [runs=500]
+# Native Linux profiling: bash ./profile.sh [threads=2] [runs=500] [algo=rle_stream]
 root=$(cd -- "$(dirname -- "$0")" && pwd)
 cd "$root"
 threads=${1:-2}
 runs=${2:-500}
+algo=${3:-rle_stream}
 jobs=${JOBS:-2}
 for count in "$threads" "$runs" "$jobs"; do
     [[ "$count" =~ ^[1-9][0-9]*$ ]] || { echo 'Threads, runs and JOBS must be positive integers' >&2; exit 1; }
 done
-[[ $# -le 2 ]] || { echo 'Usage: bash ./profile.sh [threads] [runs]' >&2; exit 1; }
+[[ $# -le 3 ]] || { echo 'Usage: bash ./profile.sh [threads] [runs] [algo]' >&2; exit 1; }
+case "$algo" in
+    rle|rle_stream|base_spaghetti|base_sauf|base_bbdt) ;;
+    *) echo "Unknown algo: $algo" >&2; exit 1 ;;
+esac
 command -v perf >/dev/null || { echo 'Install perf: sudo apt install linux-perf' >&2; exit 1; }
 [[ -f .deps/opencv/lib/cmake/opencv4/OpenCVConfig.cmake ]] || {
     echo 'Build dependencies first: JOBS=2 sh ./build.sh --algo-timing' >&2; exit 1;
@@ -45,11 +50,11 @@ echo 'Building Release with -O3 -g...'
     -DCOLORIST_DEBUG=OFF -DCOLORIST_TIMING=ON > "$out/build.log" 2>&1
 "$cmake" --build "$build" --parallel "$jobs" >> "$out/build.log" 2>&1
 cp "$build/colorist" "$out/colorist"
-cp sources/RleAlgo.h "$out/RleAlgo.h"
+cp sources/RleAlgo.h sources/RleStreamAlgo.h "$out/"
 cp "$build/compile_commands.json" "$out/compile_commands.json"
 app=("$out/colorist" --mask "$root/test_task_CV_CPP/mask.png"
     --color_mask "$root/test_task_CV_CPP/color_mask.png" --output "$out/result.png"
-    --algo-type rle --lifecycle reuse)
+    --algo-type "$algo" --lifecycle reuse)
 if [[ "$threads" -gt 1 ]]; then app+=(--parallel --threads "$threads"); fi
 
 {
@@ -57,8 +62,8 @@ if [[ "$threads" -gt 1 ]]; then app+=(--parallel --threads "$threads"); fi
     uname -a
     if [[ -f /proc/device-tree/model ]]; then tr -d '\0' < /proc/device-tree/model; echo; fi
     perf --version
-    printf 'Threads: %s\nMeasured runs: %s\nWarm-up runs: 20\n' "$threads" "$runs"
-    sha256sum "$out/colorist" sources/RleAlgo.h test_task_CV_CPP/{mask,color_mask}.png
+    printf 'Algorithm: %s\nThreads: %s\nMeasured runs: %s\nWarm-up runs: 20\n' "$algo" "$threads" "$runs"
+    sha256sum "$out/colorist" sources/RleAlgo.h sources/RleStreamAlgo.h test_task_CV_CPP/{mask,color_mask}.png
     if command -v vcgencmd >/dev/null; then vcgencmd get_throttled; vcgencmd measure_clock arm; fi
 } > "$out/environment.txt"
 perf list > "$out/events.txt" 2>&1

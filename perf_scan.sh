@@ -19,7 +19,7 @@ mkdir -p "$OUT"
 
 # Two groups of <= 6 events: the Cortex-A76 has 6 programmable counters, so
 # staying within one group avoids multiplexing and scaling estimates.
-GROUP_A=(cycles instructions stall_backend stall_frontend l1d_cache_refill l2d_cache_refill)
+GROUP_A=(cycles instructions stall_backend branch-misses l1d_cache_refill l2d_cache_refill)
 GROUP_B=(l3d_cache_refill ll_cache_miss_rd bus_access_rd bus_access_wr mem_access stall_backend_mem)
 
 supported() {  # Keep only events this kernel/PMU accepts.

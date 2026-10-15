@@ -39,9 +39,7 @@
 //   before painting, so stores don't first read those lines from DRAM.
 class RleStreamAlgo : public IAlgo {
 public:
-    explicit RleStreamAlgo(int num_threads = 1) : m_zva_bytes(ZvaBlockBytes()) {
-        SetNumThreads(num_threads);
-    }
+    explicit RleStreamAlgo(int num_threads = 1) { SetNumThreads(num_threads); }
 
     int GetOutputType() const override { return CV_8UC3; }
     // Alpha never decides a color here, so the color mask is read as BGR: 25% fewer input bytes.
@@ -149,30 +147,22 @@ public:
                         const int row = y - stripe_begin;
                         stripe.row_start[row] = static_cast<std::uint32_t>(stripe.runs.size());
 
-                        int c = 0;
                         // Previous row's runs; empty on the stripe's first row.
                         const auto [prev_begin, prev_end] = row > 0 ? stripe.RowRange(row - 1)
                                                                     : std::pair<int, int>{0, 0};
                         int cursor = prev_begin;
 
-                        while (c < width) {
-                            // Skip background; it is painted with the row later.
-                            c = ScanWhile(c, width, width, block_sz,
-                                [&](int at) { return cv::v_gt(cv::vx_load(mask_ptr + at), cmp_block); },
-                                [&](int at) { return mask_ptr[at] <= 127; });
-                            if (c == width)
-                                break;
+                        // Pass 1: all foreground runs of the row. Pass 2: label and count each.
+                        AppendRowRuns(mask_ptr, width, cmp_block, stripe.runs);
+                        const int row_end = static_cast<int>(stripe.runs.size());
 
-                            const int run_start = c;
-                            c = ScanWhile(c, width, width, block_sz,
-                                [&](int at) { return cv::v_le(cv::vx_load(mask_ptr + at), cmp_block); },
-                                [&](int at) { return mask_ptr[at] > 127; });
-
-                            stripe.runs.push_back({ run_start, c - 1, -1 });
+                        for (int k = stripe.row_start[row]; k < row_end; ++k) {
+                            const int run_start = stripe.runs[k].x0;
+                            const int c = stripe.runs[k].x1 + 1;
 
                             int component_root_id = -1;
 
-                            ForEachOverlap(stripe.runs.back(), stripe.runs, cursor, prev_end,
+                            ForEachOverlap(stripe.runs[k], stripe.runs, cursor, prev_end,
                                 [&](const PaintRun& prev_run) {
                                     const auto prev_root = uni.Root(prev_run.id);
                                     if (component_root_id == -1) {
@@ -197,7 +187,7 @@ public:
                                 ++stripe.active_by_row[y - stripe_begin];
                             }
 
-                            stripe.runs.back().id = component_root_id;
+                            stripe.runs[k].id = component_root_id;
 
                             const auto hist_id = uni.nodes[component_root_id].hist_id;
                             int x = run_start;
@@ -233,7 +223,7 @@ public:
                                 MarkBoundary(stripe, component_root_id);
                         }
 
-                        stripe.row_start[row + 1] = static_cast<std::uint32_t>(stripe.runs.size());
+                        stripe.row_start[row + 1] = static_cast<std::uint32_t>(row_end);
                         CloseRow(stripe, prev_begin, prev_end, y, painted, width, output);
                     }
 
@@ -327,24 +317,31 @@ public:
     }
 
 private:
+    // Byte comparison result (0x00/0xFF lanes) as a scalar bit mask: one bit per byte,
+    // LaneBitStride bits apart, lowest byte lowest.
+#if defined(__aarch64__) && defined(__ARM_NEON) && CV_SIMD_WIDTH == 16
+    static constexpr int LaneBitStride = 4;
+    static std::uint64_t LaneBits(const cv::v_uint8& comparison) {
+        // Narrow each byte to a nibble; cheaper than v_signmask's shift/table/add-across.
+        const std::uint64_t nibbles = vget_lane_u64(vreinterpret_u64_u8(
+            vshrn_n_u16(vreinterpretq_u16_u8(comparison.val), 4)), 0);
+        return nibbles & 0x1111111111111111ull;
+    }
+#else
+    static constexpr int LaneBitStride = 1;
+    static std::uint64_t LaneBits(const cv::v_uint8& comparison) {
+        return static_cast<std::uint32_t>(cv::v_signmask(comparison));
+    }
+#endif
+
     // Index of the first lane whose comparison result is set, or the lane count.
     template<typename Vec>
     static int FirstSetLane(const Vec& comparison) {
         constexpr int lane_bytes = sizeof(typename cv::VTraits<Vec>::lane_type);
-#if defined(__aarch64__) && defined(__ARM_NEON) && CV_SIMD_WIDTH == 16
-        // Narrow each 0x00/0xFF byte to a nibble: a scalar bit search replaces
-        // v_check_any plus v_signmask's shift/table/add-across sequence.
-        const uint8x16_t bytes = cv::v_reinterpret_as_u8(comparison).val;
-        const std::uint64_t nibbles = vget_lane_u64(vreinterpret_u64_u8(
-            vshrn_n_u16(vreinterpretq_u16_u8(bytes), 4)), 0);
-        if (nibbles == 0)
+        const std::uint64_t bits = LaneBits(cv::v_reinterpret_as_u8(comparison));
+        if (bits == 0)
             return cv::VTraits<Vec>::vlanes();
-        return __builtin_ctzll(nibbles) / (4 * lane_bytes);
-#else
-        (void)lane_bytes;
-        return cv::v_check_any(comparison) ? cv::v_scan_forward(comparison)
-                                           : cv::VTraits<Vec>::vlanes();
-#endif
+        return __builtin_ctzll(bits) / (LaneBitStride * lane_bytes);
     }
 
     // Advances x towards end while scalar_match(x) holds. Whole blocks are tested first:
@@ -374,12 +371,25 @@ private:
             return;
         }
 
+#if CV_SIMD_WIDTH == 16
+        // 48 bytes of repeated B,G,R built in registers: a stack round trip (interleaving
+        // store, then reloads) stalls on store-to-load forwarding. As 64-bit words the
+        // pattern has three phases, repeating every 24 bytes: w0 w1 w2 w0 w1 w2.
+        const std::uint64_t c = packed_color & 0xFFFFFFu;
+        const std::uint64_t w0 = c | c << 24 | c << 48;              // B G R B G R B G
+        const std::uint64_t w1 = c >> 16 | c << 8 | c << 32 | c << 56; // R B G R B G R B
+        const std::uint64_t w2 = c >> 8 | c << 16 | c << 40;         // G R B G R B G R
+        const auto first = cv::v_reinterpret_as_u8(cv::v_uint64x2(w0, w1));
+        const auto second = cv::v_reinterpret_as_u8(cv::v_uint64x2(w2, w0));
+        const auto third = cv::v_reinterpret_as_u8(cv::v_uint64x2(w1, w2));
+#else
         std::array<uchar, 3 * CV_SIMD_WIDTH> pattern;
         cv::v_store_interleave(pattern.data(), cv::vx_setall_u8(color[0]),
                                cv::vx_setall_u8(color[1]), cv::vx_setall_u8(color[2]));
         const auto first = cv::vx_load(pattern.data());
         const auto second = cv::vx_load(pattern.data() + lanes);
         const auto third = cv::vx_load(pattern.data() + 2 * lanes);
+#endif
         auto* cursor = reinterpret_cast<uchar*>(destination);
         auto* last = reinterpret_cast<uchar*>(destination + length - lanes);
         const auto store = [&](uchar* target) {
@@ -425,7 +435,6 @@ private:
     }
 
     int m_num_threads = 1;
-    std::size_t m_zva_bytes = 0; // DC ZVA block size; zero disables zero-allocation.
 
     static constexpr std::size_t ColorCacheSize = 64;
     static_assert(ColorCacheSize != 0 && (ColorCacheSize & (ColorCacheSize - 1)) == 0,
@@ -562,6 +571,38 @@ private:
         }
     }
 
+    // Appends the foreground runs [x0, x1] of one mask row (ids unset). Each block yields
+    // a bit per position where foreground starts or stops; set bits alternate start/stop.
+    static void AppendRowRuns(const uchar* mask_ptr, int width, const cv::v_uint8& threshold,
+                              std::vector<PaintRun>& runs) {
+        constexpr int lanes = CV_SIMD_WIDTH;
+        bool inside = false; // Foreground at x - 1; the row starts after background.
+        int run_start = 0;
+        const auto toggle = [&](int at) {
+            if (inside)
+                runs.push_back({run_start, at - 1, -1});
+            else
+                run_start = at;
+            inside = !inside;
+        };
+
+        int x = 0;
+        cv::v_uint8 previous = cv::vx_setzero_u8();
+        for (; width - x >= lanes; x += lanes) {
+            const auto foreground = cv::v_gt(cv::vx_load(mask_ptr + x), threshold);
+            // Lane i holds foreground[i - 1]; lane 0 the last lane of the previous block.
+            const auto shifted = cv::v_extract<lanes - 1>(previous, foreground);
+            previous = foreground;
+            for (auto bits = LaneBits(cv::v_xor(foreground, shifted)); bits; bits &= bits - 1)
+                toggle(x + __builtin_ctzll(bits) / LaneBitStride);
+        }
+        for (; x < width; ++x)
+            if ((mask_ptr[x] > 127) != inside)
+                toggle(x);
+        if (inside)
+            runs.push_back({run_start, width - 1, -1});
+    }
+
     struct Stripe {
         std::size_t GetColorId(std::uint32_t color) {
             const std::uint32_t mixed = (color ^ (color >> 16)) * 0x9E3779B1u;
@@ -642,58 +683,28 @@ private:
         Uncount(stripe, stripe.uni.nodes[root]);
     }
 
-    // DC ZVA block size in bytes, or zero when unavailable or prohibited.
-    static std::size_t ZvaBlockBytes() {
-#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
-        std::uint64_t dczid;
-        asm volatile("mrs %0, dczid_el0" : "=r"(dczid));
-        if (dczid & 0x10) // DZP: DC ZVA prohibited
-            return 0;
-        return std::size_t{4} << (dczid & 0xF);
-#else
-        return 0;
-#endif
-    }
-
-    // Allocates every block lying entirely inside [begin, begin + bytes) as zeros,
-    // without reading it from memory. Partial blocks at the edges are left alone,
-    // so neighbouring rows (possibly owned by other threads) are never touched.
-    static void ZeroAllocate(void* begin, std::size_t bytes, std::size_t block) {
-#if defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
-        const auto start = reinterpret_cast<std::uintptr_t>(begin);
-        const auto end = (start + bytes) & ~(block - 1);
-        for (auto line = (start + block - 1) & ~(block - 1); line < end; line += block)
-            asm volatile("dc zva, %0" : : "r"(line) : "memory");
-#else
-        (void)begin; (void)bytes; (void)block;
-#endif
-    }
-
-    // Paints one complete row left to right; stripe-edge component runs are deferred.
-    // Deferred pixels may be zeroed here; the final pass overwrites them.
-    static void PaintRow(Stripe& stripe, int y, int width, cv::Mat& output, std::size_t zva_bytes) {
+    // Paints one complete row: zeroing it paints the black background, then colored runs
+    // are filled. Zeroing a whole row lets AArch64 glibc's memset use DC ZVA, allocating
+    // output cache lines without first reading them from DRAM. Stripe-edge component runs
+    // are deferred; their zeroed pixels are overwritten by the final pass.
+    static void PaintRow(Stripe& stripe, int y, int width, cv::Mat& output) {
         auto* out = output.ptr<cv::Vec3b>(y);
-        if (zva_bytes)
-            ZeroAllocate(out, std::size_t(width) * sizeof(cv::Vec3b), zva_bytes);
+        std::memset(output.ptr<uchar>(y), 0, std::size_t(width) * sizeof(cv::Vec3b));
         const auto [first, last] = stripe.RowRange(y - stripe.begin);
-        int x = 0;
         for (int k = first; k < last; ++k) {
             const auto& run = stripe.runs[k];
-            FillBgrRun(out + x, run.x0 - x, 0);
             const int root = stripe.uni.Root(run.id);
             if (stripe.uni.nodes[root].boundary)
                 stripe.deferred.push_back({static_cast<std::uint32_t>(k), y});
             else
                 FillBgrRun(out + run.x0, run.x1 - run.x0 + 1, stripe.uni.nodes[root].final_color);
-            x = run.x1 + 1;
         }
-        FillBgrRun(out + x, width - x, 0);
     }
 
     // Row y is scanned. Finishes the components of runs [first, last) (the previous row)
     // that row y did not continue, then paints every row whose components are all final.
     // After the last row, y = stripe end: every remaining interior component finishes.
-    void CloseRow(Stripe& stripe, int first, int last, int y, int& painted, int width, cv::Mat& output) {
+    static void CloseRow(Stripe& stripe, int first, int last, int y, int& painted, int width, cv::Mat& output) {
         auto& uni = stripe.uni;
         for (int k = first; k < last; ++k) {
             const int root = uni.Root(stripe.runs[k].id);
@@ -705,7 +716,7 @@ private:
         // Rows above the first unfinished interior component are final.
         const int last_row = std::min(y, stripe.begin + static_cast<int>(stripe.active_by_row.size()) - 1);
         while (painted <= last_row && stripe.active_by_row[painted - stripe.begin] == 0)
-            PaintRow(stripe, painted++, width, output, m_zva_bytes);
+            PaintRow(stripe, painted++, width, output);
     }
 
     // Stripe owning a global node id; upper_bound skips stripes without nodes.
