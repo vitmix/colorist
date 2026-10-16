@@ -421,7 +421,10 @@ private:
 
     int m_num_threads = 1;
 
-    static constexpr std::size_t ColorCacheSize = 64;
+    // Direct-mapped color -> palette id cache in front of the sorted palette; misses are
+    // only slower, never wrong. 256 entries (3 KB) leave few collisions for palettes of
+    // up to a few hundred colors and still fit in L1.
+    static constexpr std::size_t ColorCacheSize = 256;
     static_assert(ColorCacheSize != 0 && (ColorCacheSize & (ColorCacheSize - 1)) == 0,
         "Color cache size must be a power of two");
 
@@ -714,26 +717,34 @@ private:
         return m_stripes[i].uni.nodes[global - m_base[i]];
     }
 
+    UnionNode& GlobalNodeWithHint(int global, int hint) {
+        return m_stripes[hint].uni.nodes[global - m_base[hint]];
+    }
+
     // Moves the loser root's histogram into the winner's, translating palette ids across stripes.
     void MergeBoundaryHistograms(int winner, int loser) {
-        auto& destination = m_stripes[StripeOf(winner)];
-        auto& source = m_stripes[StripeOf(loser)];
-        const int winner_hist = GlobalNode(winner).hist_id;
-        auto& loser_node = GlobalNode(loser);
+        const int dest_id = StripeOf(winner);
+        const int sorc_id = StripeOf(loser);
+        
+        auto& destination = m_stripes[dest_id];
+        auto& source = m_stripes[sorc_id];
+
+        const int winner_hist = GlobalNodeWithHint(winner, dest_id).hist_id;
+        auto& loser_hist = GlobalNodeWithHint(loser, sorc_id).hist_id;
 
         if (&destination == &source) {
-            destination.hists.Merge(winner_hist, loser_node.hist_id);
+            destination.hists.Merge(winner_hist, loser_hist);
         } else {
-            const auto& counts = source.hists.Get(loser_node.hist_id);
+            const auto& counts = source.hists.Get(loser_hist);
             for (std::size_t color_id = 0; color_id < counts.size(); ++color_id) {
                 if (counts[color_id] == 0)
                     continue;
                 const auto destination_id = destination.GetColorId(source.palette[color_id]);
                 destination.hists.AddColorFreq(winner_hist, destination_id, counts[color_id]);
             }
-            source.hists.free_slots.push_back(loser_node.hist_id);
+            source.hists.free_slots.push_back(loser_hist);
         }
-        loser_node.hist_id = -1;
+        loser_hist = -1;
     }
 
     std::vector<Stripe> m_stripes;
