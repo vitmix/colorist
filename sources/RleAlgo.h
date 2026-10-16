@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numeric>
 #include <vector>
 #include <utility>
 
@@ -399,13 +400,7 @@ private:
             stripe.deferred.clear();
             stripe.uni.nodes.clear();
             stripe.uni.nodes.reserve(expected_runs);
-
-            auto& free_slots = stripe.hists.free_slots;
-            auto& hist_data = stripe.hists.data;
-            free_slots.clear();
-            free_slots.reserve(hist_data.size());
-            for (std::size_t i = 0; i < hist_data.size(); ++i)
-                free_slots.push_back(static_cast<int>(i));
+            stripe.hists.Reset();
         }
     }
 
@@ -506,12 +501,24 @@ private:
     struct Histograms {
         void Merge(int id_a, int id_b) {
             auto& slot_a = Get(id_a);
-            const auto& slot_b = Get(id_b);
+            auto& slot_b = Get(id_b);
+
             if (slot_a.size() < slot_b.size())
                 slot_a.resize(slot_b.size());
+
             for (std::size_t i = 0; i < slot_b.size(); ++i)
                 slot_a[i] += slot_b[i];
-            free_slots.push_back(id_b);
+            Release(id_b);
+        }
+
+        // Slots are recycled: only components still being scanned hold one, so the
+        // working set stays small and hot in cache.
+        void Release(int id) { free_slots.push_back(id); }
+
+        // Every slot is free at the start of a frame; storage is kept between frames.
+        void Reset() {
+            free_slots.resize(data.size());
+            std::iota(free_slots.begin(), free_slots.end(), 0);
         }
 
         int AcquireSlot() {
@@ -666,7 +673,7 @@ private:
     static void FinalizeComponent(Stripe& stripe, int root) {
         auto& node = stripe.uni.nodes[root];
         node.final_color = SelectColor(stripe, node.hist_id);
-        stripe.hists.free_slots.push_back(node.hist_id);
+        stripe.hists.Release(node.hist_id);
         node.hist_id = -1;
         Uncount(stripe, stripe.uni.nodes[root]);
     }
@@ -742,7 +749,7 @@ private:
                 const auto destination_id = destination.GetColorId(source.palette[color_id]);
                 destination.hists.AddColorFreq(winner_hist, destination_id, counts[color_id]);
             }
-            source.hists.free_slots.push_back(loser_hist);
+            source.hists.Release(loser_hist);
         }
         loser_hist = -1;
     }
