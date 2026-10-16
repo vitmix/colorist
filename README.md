@@ -88,7 +88,7 @@ and 25 MB of output, each read or written once.
 
 | Setting | Value | Reason |
 |---|---|---|
-| Threads, Raspberry Pi 5 | **2** | Measured best; with more threads the run is limited by memory bandwidth (~6.3 GB/s). |
+| Threads, Raspberry Pi 5 | **2** | Measured best. One thread is compute-bound; beyond two, the Pi's usable memory bandwidth drops with every extra stream (see memory floor below). |
 | Threads, Windows (i5-11400H, 6 cores) | **6** | One per physical core; 5–10 threads perform the same. |
 | Color mask decoded as BGR | `IMREAD_COLOR` | Alpha is 255 on every pixel of the input, so it never decides a color; reading 3 instead of 4 bytes per pixel cuts input traffic by 8 MB. Colors differing only in alpha count as one color. |
 | Output | `CV_8UC3` BGR | No alpha needed; 25% fewer bytes written. |
@@ -101,6 +101,29 @@ Thread scaling, `rle`, reuse lifecycle (mean ms per frame):
 |---|---|---|---|---|---|---|---|
 | Raspberry Pi 5 | 19.41 | **10.85** | 11.08 | 11.79 | — | — | — |
 | Windows i5-11400H | 11.67 | 6.27 | 4.78 | 4.50 | **4.07** | 4.36 | 4.66 |
+
+### Memory floor
+
+`bench_fill.sh` runs the frame's unavoidable memory traffic with no labeling at all:
+read every mask and BGR byte (33 MB), zero each output row and overwrite its foreground
+runs (25 MB), in the same row stripes as `rle`. Median ms per frame:
+
+| Threads | 1 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|
+| Raspberry Pi 5: floor | **6.87** (8.5 GB/s) | 7.93 (7.3 GB/s) | 8.69 (6.7 GB/s) | 9.12 (6.4 GB/s) | — |
+| Raspberry Pi 5: `rle` | 19.41 | **10.85** | 11.08 | 11.79 | — |
+| Windows i5-11400H: floor | 8.29 | 4.35 | — | 3.83 | **3.86** |
+| Windows i5-11400H: `rle` | 11.67 | 6.27 | 4.78 | 4.50 | **4.07** |
+
+- On the Pi a single core already saturates DRAM, and more concurrent streams lower
+  the usable bandwidth: the floor itself rises with every thread. Writes are the
+  larger part (25 MB take 4.2 ms, 33 MB of reads 2.3 ms).
+- At 2 threads `rle` reads about as much from DRAM as the floor kernel (41 vs 39 MB per
+  frame, from `L3 refill` counters); the remaining gap is computation: ~107M versus
+  ~17M instructions per frame. One thread is compute-bound (2.8× the floor); a second
+  thread halves the computation at a cost of ~1 ms of bandwidth, which makes 2 threads
+  the best setting (1.37× the 2-thread floor).
+- On Windows `rle` at 6 threads runs within ~5% of the floor (4.07 vs 3.86 ms).
 
 ## Benchmark and verification
 
@@ -124,4 +147,5 @@ histogram/union-find edge cases. `tests/test_rle_reuse.cpp` checks repeated
 calls on one object and that nothing is written outside the output view.
 
 Linux profiling: `bash ./profile.sh [threads] [runs]` (perf record + annotated
-hotspots) and `bash ./perf_scan.sh` (per-frame hardware counters for 1–4 threads).
+hotspots), `bash ./perf_scan.sh` (per-frame hardware counters for 1–4 threads) and
+`bash ./bench_fill.sh [runs] [kernels] [threads]` (memory floor; source in `benchmarks/fill/`).
