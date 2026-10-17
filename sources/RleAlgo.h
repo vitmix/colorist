@@ -175,7 +175,9 @@ public:
 
                             stripe.runs[k].id = component_root_id;
 
-                            const auto hist_id = uni.nodes[component_root_id].hist_id;
+                            // The slot object stays put during the run; a new color may only
+                            // grow its buffer, so index through the reference, not a raw pointer.
+                            auto& counts = hists.Get(uni.nodes[component_root_id].hist_id);
                             int x = run_start;
                             while (x < c) {
                                 const auto color = LoadBgr(cmask_ptr + 3 * x);
@@ -198,8 +200,7 @@ public:
                                     prev_color_id = stripe.GetColorId(color);
                                     cache_valid = true;
                                 }
-                                hists.AddColorFreq(hist_id, prev_color_id,
-                                                   static_cast<std::uint32_t>(x - stretch_start));
+                                counts[prev_color_id] += static_cast<std::uint32_t>(x - stretch_start);
                             }
 
                             auto& state = stripe.uni.nodes[component_root_id];
@@ -437,7 +438,7 @@ private:
         int y;
     };
 
-    // One union-find node per started component; fields beyond hist_id are meaningful on roots.
+    // One union-find node per started component; the fields after size are meaningful on roots.
     struct UnionNode {
         std::uint32_t parent;
         std::uint32_t size;
@@ -498,16 +499,15 @@ private:
         bool valid{false};
     };
 
+    // Per-component color counts. Every slot holds exactly `bins` counters, one per palette
+    // color, so adding a count needs no size check; a new palette color grows every slot
+    // once (rare: the palette is small and kept between frames).
     struct Histograms {
         void Merge(int id_a, int id_b) {
-            auto& slot_a = Get(id_a);
-            auto& slot_b = Get(id_b);
-
-            if (slot_a.size() < slot_b.size())
-                slot_a.resize(slot_b.size());
-
-            for (std::size_t i = 0; i < slot_b.size(); ++i)
-                slot_a[i] += slot_b[i];
+            auto& a = data[id_a];
+            const auto& b = data[id_b];
+            for (std::size_t i = 0; i < bins; ++i)
+                a[i] += b[i];
             Release(id_b);
         }
 
@@ -530,16 +530,15 @@ private:
                 slot_id = free_slots.back();
                 free_slots.pop_back();
             }
-            auto& inner = Get(slot_id);
-            std::fill(inner.begin(), inner.end(), std::uint32_t{0});
+            data[slot_id].assign(bins, 0);
             return slot_id;
         }
 
-        void AddColorFreq(int hist_id, std::size_t color_id, std::uint32_t freq) {
-            auto& hist = Get(hist_id);
-            if (hist.size() <= color_id)
-                hist.resize(color_id + 1);
-            hist[color_id] += freq;
+        // Called when the palette gains a color.
+        void AddBin() {
+            ++bins;
+            for (auto& slot : data)
+                slot.push_back(0);
         }
 
         std::vector<std::uint32_t>& Get(int id) { return data[id]; }
@@ -547,6 +546,7 @@ private:
 
         std::vector<std::vector<std::uint32_t>> data;
         std::vector<int> free_slots;
+        std::size_t bins = 0; // == palette size
     };
 
     template<typename OnOverlap>
@@ -616,6 +616,7 @@ private:
                 return entry->id;
             const auto id = static_cast<std::uint32_t>(palette.size());
             palette.push_back(color);
+            hists.AddBin();
             color_ids.insert(entry, {color, id});
             return id;
         }
@@ -747,7 +748,7 @@ private:
                 if (counts[color_id] == 0)
                     continue;
                 const auto destination_id = destination.GetColorId(source.palette[color_id]);
-                destination.hists.AddColorFreq(winner_hist, destination_id, counts[color_id]);
+                destination.hists.Get(winner_hist)[destination_id] += counts[color_id];
             }
             source.hists.Release(loser_hist);
         }
