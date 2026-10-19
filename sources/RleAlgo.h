@@ -103,8 +103,6 @@ public:
 
         cv::parallel_for_(cv::Range(0, stripe_count),
             [&](const cv::Range& range) {
-                // One block: a vector of mask bytes, or as many BGR pixels deinterleaved.
-                const int block_sz = cv::VTraits<cv::v_uint8>::vlanes();
                 const cv::v_uint8 cmp_block = cv::vx_setall_u8(127);
 
                 for (int i = range.start; i < range.end; ++i) {
@@ -181,19 +179,8 @@ public:
                             int x = run_start;
                             while (x < c) {
                                 const auto color = LoadBgr(cmask_ptr + 3 * x);
-                                const auto blue = cv::vx_setall_u8(static_cast<uchar>(color));
-                                const auto green = cv::vx_setall_u8(static_cast<uchar>(color >> 8));
-                                const auto red = cv::vx_setall_u8(static_cast<uchar>(color >> 16));
                                 const int stretch_start = x;
-                                // Blocks may extend past the run, but never past the row.
-                                x = ScanWhile(x + 1, c, width, block_sz,
-                                    [&](int at) {
-                                        cv::v_uint8 b, g, r;
-                                        cv::v_load_deinterleave(cmask_ptr + 3 * at, b, g, r);
-                                        return cv::v_or(cv::v_or(cv::v_ne(b, blue), cv::v_ne(g, green)),
-                                                        cv::v_ne(r, red));
-                                    },
-                                    [&](int at) { return LoadBgr(cmask_ptr + 3 * at) == color; });
+                                x = StretchEnd(cmask_ptr, x + 1, c, width, color);
 
                                 if (!cache_valid || color != prev_color) {
                                     prev_color = color;
@@ -321,33 +308,30 @@ private:
     }
 #endif
 
-    // Index of the first lane whose comparison result is set, or the lane count.
-    template<typename Vec>
-    static int FirstSetLane(const Vec& comparison) {
-        constexpr int lane_bytes = sizeof(typename cv::VTraits<Vec>::lane_type);
-        const std::uint64_t bits = LaneBits(cv::v_reinterpret_as_u8(comparison));
-        if (bits == 0)
-            return cv::VTraits<Vec>::vlanes();
-        return __builtin_ctzll(bits) / (LaneBitStride * lane_bytes);
-    }
+    // First pixel in [x, end) of a BGR row whose color differs from `color`, or end.
+    // Stretches are short (median ~12 pixels), so plain 64-bit compares beat SIMD blocks:
+    // one 8-byte load covers two pixels (6 bytes; the 2 spare bytes are masked off), and
+    // each step checks two pairs. Loads never pass the row's last byte.
+    static int StretchEnd(const uchar* bgr, int x, int end, int width, std::uint32_t color) {
+        constexpr std::uint64_t kTwoPixels = 0xFFFFFFFFFFFFull;
+        const std::uint64_t pair = color | (std::uint64_t{color} << 24);
+        const auto differs = [&](int p) { return (Load64(bgr + 3 * p) ^ pair) & kTwoPixels; };
+        const auto first_of = [](int p, std::uint64_t diff) { return (diff & 0xFFFFFFu) ? p : p + 1; };
 
-    // Advances x towards end while scalar_match(x) holds. Whole blocks are tested first:
-    // vector_mismatch(x) compares `lanes` elements at x, setting lanes that end the stretch.
-    // Blocks may be read up to `readable` (>= end); a match running past end stops at end.
-    template<typename VectorMismatch, typename ScalarMatch>
-    static int ScanWhile(int x, int end, int readable, int lanes, VectorMismatch&& vector_mismatch,
-                         ScalarMatch&& scalar_match) {
-        while (x < end && readable - x >= lanes) {
-            const int n = FirstSetLane(vector_mismatch(x));
-            if (x + n >= end)
-                return end;
-            x += n;
-            if (n < lanes)
-                return x;
+        // An 8-byte load at pixel p reads bytes 3p..3p+7: needs p + 3 <= width.
+        for (; x + 4 <= end && x + 5 <= width; x += 4) {
+            if (const auto diff = differs(x))
+                return first_of(x, diff);
+            if (const auto diff = differs(x + 2))
+                return first_of(x + 2, diff);
         }
-        while (x < end && scalar_match(x))
-            ++x;
-        return x;
+        for (; x + 2 <= end && x + 3 <= width; x += 2)
+            if (const auto diff = differs(x))
+                return first_of(x, diff);
+        for (; x < end; ++x)
+            if (LoadBgr(bgr + 3 * x) != color)
+                return x;
+        return end;
     }
 
     static void FillBgrRun(cv::Vec3b* destination, int length, std::uint32_t packed_color) {
@@ -406,8 +390,20 @@ private:
     }
 
     // Packs a BGR pixel as B | G << 8 | R << 16, the layout UnpackColor expects.
+    // A 2-byte load (B, G on little-endian CPUs) plus the R byte, in registers. (A 3-byte
+    // memcpy into a word made GCC assemble the value on the stack: a store-forwarding stall.)
     static inline std::uint32_t LoadBgr(const uchar* pixel) {
-        return std::uint32_t(pixel[0]) | (std::uint32_t(pixel[1]) << 8) | (std::uint32_t(pixel[2]) << 16);
+        std::uint16_t blue_green;
+        std::memcpy(&blue_green, pixel, sizeof(blue_green));
+        return blue_green | (std::uint32_t(pixel[2]) << 16);
+    }
+
+    // Unaligned 8-byte load; on little-endian CPUs (x86, AArch64) byte 0 is the lowest byte,
+    // matching LoadBgr's packing for the two pixels it covers.
+    static inline std::uint64_t Load64(const uchar* bytes) {
+        std::uint64_t value;
+        std::memcpy(&value, bytes, sizeof(value));
+        return value;
     }
 
     static cv::Vec3b UnpackColor(std::uint32_t color) {
