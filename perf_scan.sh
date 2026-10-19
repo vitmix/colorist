@@ -17,10 +17,12 @@ mkdir -p "$OUT"
 
 [ -x "$EXE" ] || { echo "Build first: JOBS=2 sh ./build.sh --algo-timing" >&2; exit 1; }
 
-# Two groups of <= 6 events: the Cortex-A76 has 6 programmable counters, so
-# staying within one group avoids multiplexing and scaling estimates.
+# Two groups of <= 6 hardware events: the Cortex-A76 has 6 programmable counters, so
+# staying within one group avoids multiplexing and scaling estimates. cpu-migrations and
+# context-switches are kernel software events and need no hardware counter.
 GROUP_A=(cycles instructions stall_backend branch-misses l1d_cache_refill l2d_cache_refill)
-GROUP_B=(l3d_cache_refill ll_cache_miss_rd bus_access_rd bus_access_wr mem_access stall_backend_mem)
+GROUP_B=(l3d_cache_refill ll_cache_miss_rd bus_access_rd bus_access_wr mem_access stall_backend_mem
+         cpu-migrations context-switches)
 
 supported() {  # Keep only events this kernel/PMU accepts.
     local kept=() e
@@ -112,6 +114,8 @@ for a, t, p, ms, (cmin, cmax) in rows:
           f"{p.get('l2d_cache_refill', float('nan'))/M:>12.2f}{l3/M:>12.2f}{l3mb:>7.1f}{l3mb/ms*1000:>9.0f}")
 print("\nRaw per-frame counters:")
 for a, t, p, ms, _ in rows:
-    print(f"{a} t={t}: " + ", ".join(f"{k}={v/M:.2f}M" for k, v in sorted(p.items())))
+    # Large counters in millions; small ones (migrations, context switches) as plain numbers.
+    print(f"{a} t={t}: " + ", ".join(f"{k}={v/M:.2f}M" if abs(v) >= 1e4 else f"{k}={v:.2f}"
+                                     for k, v in sorted(p.items())))
 EOF
 echo "Results: $OUT"

@@ -215,6 +215,9 @@ int main(int argc, char* argv[]) {
 
         std::vector<Measurement> measurements;
         measurements.reserve(measured_runs);
+#ifdef COLORIST_TIMING
+        std::vector<std::pair<double, double>> stripe_span_sums; // RLE: summed start/end per stripe.
+#endif
         for (int run = 0; run < measured_runs; ++run) {
             auto fresh_algo = fresh ? CreateAlgo(algo_type, thread_count) : nullptr;
             auto* current_algo = fresh_algo ? fresh_algo.get() : algo.get();
@@ -226,6 +229,14 @@ int main(int argc, char* argv[]) {
             measurement.total_ms = elapsed_ms;
 #ifdef COLORIST_TIMING
             measurement.stages_ms = current_algo->GetTimings();
+            if (const auto* rle = dynamic_cast<const RleAlgo*>(current_algo)) {
+                const auto& spans = rle->GetStripeSpans();
+                stripe_span_sums.resize(spans.size());
+                for (std::size_t i = 0; i < spans.size(); ++i) {
+                    stripe_span_sums[i].first += spans[i].first;
+                    stripe_span_sums[i].second += spans[i].second;
+                }
+            }
 #endif
             if (fresh_algo) {
                 // The caller-owned output stays alive; time algorithm instance/workspace destruction.
@@ -244,6 +255,22 @@ int main(int argc, char* argv[]) {
         if (measured_runs > 1)
             std::cout << "Stage timings for the last measured run:\n";
         algo->PrintTimings(measurements.back().stages_ms);
+        if (!stripe_span_sums.empty()) {
+            // Scan balance: the section ends when the slowest stripe does; the others wait.
+            double last_end = 0;
+            for (const auto& [start, end] : stripe_span_sums)
+                last_end = std::max(last_end, end / measured_runs);
+            std::cout << "RLE stripe balance (mean ms after the scan section starts):\n"
+                      << "stripe   start      end     busy  waits for slowest\n" << std::fixed << std::setprecision(3);
+            for (std::size_t i = 0; i < stripe_span_sums.size(); ++i) {
+                const double start = stripe_span_sums[i].first / measured_runs;
+                const double end = stripe_span_sums[i].second / measured_runs;
+                std::cout << std::setw(6) << i << std::setw(8) << start << std::setw(9) << end
+                          << std::setw(9) << end - start << std::setw(19) << last_end - end << '\n';
+            }
+            std::cout.unsetf(std::ios::floatfield);
+            std::cout << std::setprecision(6);
+        }
 #endif
         if (fresh)
             std::cout << "Instance cleanup (last measured run): " << measurements.back().teardown_ms << " ms\n";

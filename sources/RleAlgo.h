@@ -65,6 +65,9 @@ public:
         };
         return names;
     }
+
+    // Last Compute: each stripe's scan start and end, in ms after the scan section began.
+    const std::vector<std::pair<double, double>>& GetStripeSpans() const { return m_stripe_spans_ms; }
 #endif
 
     void Compute(const cv::Mat &mask, const cv::Mat &color_mask, cv::Mat& output) override {
@@ -99,6 +102,11 @@ public:
 
 #ifdef COLORIST_TIMING
         record_time(0);
+        m_stripe_spans_ms.assign(stripe_count, {0.0, 0.0});
+        const auto scan_start = Clock::now();
+        const auto since_scan = [&] {
+            return std::chrono::duration<double, std::milli>(Clock::now() - scan_start).count();
+        };
 #endif
 
         cv::parallel_for_(cv::Range(0, stripe_count),
@@ -106,6 +114,9 @@ public:
                 const cv::v_uint8 cmp_block = cv::vx_setall_u8(127);
 
                 for (int i = range.start; i < range.end; ++i) {
+#ifdef COLORIST_TIMING
+                    m_stripe_spans_ms[i].first = since_scan();
+#endif
                     const int stripe_begin = static_cast<int>(std::int64_t(height) * i / stripe_count);
                     const int stripe_end = static_cast<int>(std::int64_t(height) * (i + 1) / stripe_count);
                     const int stripe_rows = stripe_end - stripe_begin;
@@ -205,6 +216,9 @@ public:
                     // touching an internal stripe edge, which wait for reconciliation.
                     const auto [last_begin, last_end] = stripe.RowRange(stripe_rows - 1);
                     CloseRow(stripe, last_begin, last_end, stripe_end, painted, width, output);
+#ifdef COLORIST_TIMING
+                    m_stripe_spans_ms[i].second = since_scan();
+#endif
                 }
             }, m_num_threads
         );
@@ -375,6 +389,7 @@ private:
 
 #ifdef COLORIST_TIMING
     std::array<double, 5> m_timings_ms{};
+    std::vector<std::pair<double, double>> m_stripe_spans_ms; // Per stripe: scan start, end.
 #endif
 
     void ResetWorkingBuffers(int height) {
@@ -594,7 +609,9 @@ private:
             runs.push_back({run_start, width - 1, -1});
     }
 
-    struct Stripe {
+    // Each stripe starts on its own cache line: stripes are adjacent in m_stripes and
+    // written by different threads, so neighbours must not share (false sharing).
+    struct alignas(64) Stripe {
         std::size_t GetColorId(std::uint32_t color) {
             const std::uint32_t mixed = (color ^ (color >> 16)) * 0x9E3779B1u;
             auto& cached = color_cache[(mixed ^ (mixed >> 16)) & (ColorCacheSize - 1)];
